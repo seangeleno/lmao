@@ -199,7 +199,8 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                     / (gamma + 1)
                 )
                 target_stake_A = (
-                    self.wallets.get_total(self.stake_currency) - target_stake_B
+                    self.wallets.get_total(self.stake_currency) / max_pairs
+                    - target_stake_B
                 )
 
                 # 3. Check if position value meets minimum requirements (independent of leverage!)

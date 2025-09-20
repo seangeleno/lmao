@@ -1,18 +1,15 @@
 # --- Import Freqtrade Libraries ---
 import itertools
-
-from freqtrade.strategy.interface import IStrategy
-from freqtrade.strategy import IntParameter, DecimalParameter
-import pandas as pd
-import numpy as np
-import talib as ta
-from datetime import timedelta
-import statsmodels.api as sm
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.regression.linear_model import OLS
 import json
-import os
 import logging
+import os
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from freqtrade.strategy.interface import IStrategy
+from statsmodels.tsa.stattools import adfuller
 
 logger = logging.getLogger(__name__)
 
@@ -39,34 +36,45 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         current_pair = metadata["pair"]
         dataframe["zero"] = 0
 
+        # Chỉ chạy logic tính toán một lần khi candle của cặp cuối cùng trong whitelist đến
         if current_pair != self.whitelist[-1]:
             return dataframe
 
         all_new_params = {}
         log_close_prices = {}
 
-        all_dfs = {
-            pair: self.dp.get_pair_dataframe(pair, self.timeframe)
-            for pair in self.whitelist
-        }
+        # --- TỐI ƯU 1: Chỉ tải cột 'close' và chuyển sang float32 ---
+        # Tạo một DataFrame duy nhất chứa tất cả các giá đóng cửa cần thiết.
+        close_series_list = []
+        for pair in self.whitelist:
+            # Lấy toàn bộ dataframe nhưng chỉ giữ lại cột 'close'
+            # và chuyển đổi kiểu dữ liệu để tiết kiệm bộ nhớ
+            close_data = self.dp.get_pair_dataframe(pair, self.timeframe)[
+                "close"
+            ].astype(np.float32)
+            close_data.name = pair  # Đặt tên cho Series để sau này join
+            close_series_list.append(close_data)
 
-        for pair, df in all_dfs.items():
-            if df is not None and not df.empty:
-                log_close_prices[f"{pair}_log_close"] = df["close"].iloc[-1]
+        # Gộp tất cả các Series giá đóng cửa vào một DataFrame duy nhất
+        all_closes_df = pd.concat(close_series_list, axis=1)
 
+        # Lấy giá đóng cửa cuối cùng cho log_close_prices
+        for pair in self.whitelist:
+            if not all_closes_df[pair].empty:
+                log_close_prices[f"{pair}_log_close"] = all_closes_df[pair].iloc[-1]
+
+        # --- TỐI ƯU 2: Tái cấu trúc vòng lặp để không tạo DataFrame mới liên tục ---
         for pair_y, pair_x in itertools.permutations(self.whitelist, 2):
             try:
-                df_y = all_dfs[pair_y]
-                df_x = all_dfs[pair_x]
+                # Chọn 2 cột cần thiết từ DataFrame đã gộp, không cần tạo df_merged mới
+                df_pair = all_closes_df[[pair_y, pair_x]].copy()
+                df_pair.columns = ["y", "x"]  # Đổi tên cột để tương thích với fn_ecm
+                df_pair.dropna(inplace=True)
 
-                df_merged = pd.DataFrame(index=df_y.index)
-                df_merged["y"] = df_y["close"]
-                df_merged["x"] = df_x["close"]
-                df_merged.dropna(inplace=True)
-
-                if len(df_merged) < 1000:
+                if len(df_pair) < 1000:
                     continue
 
+                # Các hàm tính toán giữ nguyên
                 (
                     c,
                     gamma,
@@ -77,11 +85,10 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
                     consistency_score,
                     half_life,
                     corr,
-                ) = self.fn_ecm(df_merged, "y", "x")
+                ) = self.fn_ecm(df_pair, "y", "x")
 
                 pvalue, adfstat = self.adf_test_on_residuals(z)
 
-                # pair_key_sorted = '_'.join(sorted((pair_y,pair_x)))
                 pair_key = f"{pair_y}_{pair_x}"
 
                 all_new_params[pair_key] = {
@@ -100,6 +107,7 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
                 }
             except Exception as e:
                 logger.error(f"分析配对 {pair_y}/{pair_x} 时出错: {e}")
+
         self.overwrite_run_config_params(all_new_params, log_close_prices)
 
         return dataframe
@@ -112,23 +120,16 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
     def populate_exit_trend(
         self, dataframe: pd.DataFrame, metadata: dict
     ) -> pd.DataFrame:
-
         return dataframe
 
     def fn_ecm(self, df: pd.DataFrame, y_col: str, x_col: str):
+        # Dữ liệu đầu vào đã là float32 nên các tính toán sẽ nhanh hơn
         y = df[y_col]
         x = df[x_col]
 
-        # 验证输入
         assert isinstance(y, pd.Series), "y 必须是 pd.Series 类型"
         assert isinstance(x, pd.Series), "x 必须是 pd.Series 类型"
         assert y.index.equals(x.index), "y 和 x 必须有相同的时间索引"
-
-        # 空值处理
-        if y.isnull().any() or x.isnull().any():
-            temp_df = pd.concat([y, x], axis=1).dropna()
-            y = temp_df[y_col]
-            x = temp_df[x_col]
 
         # 皮尔森相关系数
         corr = y.corr(x)
@@ -138,17 +139,12 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         long_run_fit = long_run_ols.fit()
         c, gamma = long_run_fit.params
 
-        # 残差（只取有效部分，避免稀疏）
         z = long_run_fit.resid
 
-        # 使用 z-score 标准化残差（只对有效部分）
         z_std = z.std()
         z_mean = z.mean()
         z_score = (z - z_mean) / z_std
-        # z_std = z_score.std()
-        # z_mean = z_score.mean()
 
-        # --- 半衰期计算 ---
         z_nonan = z.dropna()
         if len(z_nonan) > 1:
             z_lag = z_nonan.shift(1).dropna()
@@ -164,7 +160,6 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         else:
             half_life = np.nan
 
-        # --- 穿越一致性分数计算 ---
         crossings = (np.sign(z).shift(1) * np.sign(z)) < 0
         crossing_indices = crossings[crossings].index
 
@@ -176,7 +171,6 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
             if interval_mean > 0 and interval_std > 0:
                 consistency_score = 1000 / (interval_mean * interval_std)
 
-        # --- 只统计z分数穿越1和-1的次数 ---
         z_score_lag = z_score.shift(1)
         crossing_1 = ((z_score_lag < 1) & (z_score >= 1)).sum() + (
             (z_score_lag > 1) & (z_score <= 1)
@@ -186,7 +180,6 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         ).sum()
         z_cross_zero_count = crossing_1 + crossing_minus1
 
-        # 日志输出
         if half_life < 1440 and half_life > 0:
             logger.info(f"Half-life for {y_col} vs {x_col}: {half_life}")
             logger.info(f"corr {y_col} vs {x_col}: {corr}")
@@ -210,71 +203,50 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
             return [self.convert_numpy_types(v) for v in obj]
         elif isinstance(obj, (np.integer, np.int32, np.int64)):
             return int(obj)
+        # Chuyển đổi cả float32 và float64
         elif isinstance(obj, (np.floating, np.float32, np.float64)):
             return float(obj)
-        elif pd.isna(obj):  # 处理Pandas的NaN
+        elif pd.isna(obj):
             return None
         else:
             return obj
 
     def adf_test_on_residuals(self, z: pd.Series) -> tuple[float, float]:
-        """
-        对给定的残差序列执行增强迪基-福勒（ADF）检验。
-        返回 pvalue 和 adfstat
-        """
         z_cleaned = z.dropna()
-
         if len(z_cleaned) < 20:
-            # 如果数据点太少，返回一个明确表示测试未成功运行的值
             return 1.0, 0.0
-
-        # adfuller返回多个值，我们捕获adfstat和pvalue
-        adfstat, pvalue, usedlag, nobs, crit_values = adfuller(
-            z_cleaned, maxlag=1, autolag=None
-        )
-        pvalue = pvalue
-        adfstat = adfstat
-
+        adfstat, pvalue, _, _, _ = adfuller(z_cleaned, maxlag=1, autolag=None)
         return pvalue, adfstat
 
     def overwrite_run_config_params(self, new_params: dict, log_close_prices: dict):
-        """
-        负责读取 run 策略的配置文件，用新计算出的参数，完整地覆盖旧的参数部分，然后写回。
-        """
         run_config_path = "configs/future_pair_pairing_run_0723.json"
-
         logger.info(f"准备将 {len(new_params)} 个配对的新参数写入到: {run_config_path}")
 
         try:
-            pvalue_dict = {}
-            gamma_dict = {}
-            c_dict = {}
-            z_mean_dict = {}
-            z_std_dict = {}
-            z_cross_zero_count_dict = {}
-            consistency_score_dict = {}
-            half_life_dict = {}
-            corr_dict = {}
-            adfstat_dict = {}
+            # Tạo các dict từ new_params, không cần thay đổi logic này
+            param_dicts = {
+                f"{key}_dict": {}
+                for key in [
+                    "pvalue",
+                    "adfstat",
+                    "gamma",
+                    "c",
+                    "z_mean",
+                    "z_std",
+                    "z_cross_zero_count",
+                    "consistency_score",
+                    "half_life",
+                    "corr",
+                ]
+            }
 
             for key, params in new_params.items():
                 y = params["regression_y"]
                 x = params["regression_x"]
-
-                pvalue_dict[f"{y}_{x}_pvalue"] = params["pvalue"]
-                adfstat_dict[f"{y}_{x}_adfstat"] = params["adfstat"]
-                gamma_dict[f"{y}_{x}_gamma"] = params["gamma"]
-                c_dict[f"{y}_{x}_c"] = params["c"]
-                z_mean_dict[f"{y}_{x}_z_mean"] = params["z_mean"]
-                z_std_dict[f"{y}_{x}_z_std"] = params["z_std"]
-                z_cross_zero_count_dict[f"{y}_{x}_z_cross_zero_count"] = params[
-                    "z_cross_zero_count"
-                ]
-                consistency_score_dict[f"{y}_{x}_consistency_score"] = params[
-                    "consistency_score"
-                ]
-                half_life_dict[f"{y}_{x}_half_life"] = params["half_life"]
-                corr_dict[f"{y}_{x}_corr"] = params["corr"]
+                prefix = f"{y}_{x}"
+                for param_name in param_dicts:
+                    dict_key = param_name.replace("_dict", "")
+                    param_dicts[param_name][f"{prefix}_{dict_key}"] = params[dict_key]
 
             run_config_data = {}
             if os.path.exists(run_config_path):
@@ -285,16 +257,8 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
                     f"目标配置文件 {run_config_path} 不存在，将创建一个新的。"
                 )
 
-            run_config_data["pvalue_dict"] = pvalue_dict
-            run_config_data["adfstat_dict"] = adfstat_dict
-            run_config_data["gamma_dict"] = gamma_dict
-            run_config_data["c_dict"] = c_dict
-            run_config_data["z_mean_dict"] = z_mean_dict
-            run_config_data["z_std_dict"] = z_std_dict
-            run_config_data["z_cross_zero_count_dict"] = z_cross_zero_count_dict
-            run_config_data["consistency_score_dict"] = consistency_score_dict
-            run_config_data["half_life_dict"] = half_life_dict
-            run_config_data["corr_dict"] = corr_dict
+            # Cập nhật run_config_data với các dict đã tạo
+            run_config_data.update(param_dicts)
             run_config_data["log_close_dict"] = log_close_prices
 
             with open(run_config_path, "w", encoding="utf-8") as f:
@@ -304,8 +268,7 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
                     ensure_ascii=False,
                     indent=4,
                 )
-
-            logger.info(f"成功覆写 run 策略的配置文件！")
+            logger.info("成功覆写 run 策略的配置文件！")
 
         except Exception as e:
             logger.error(f"覆写配置文件时出错: {e}")
