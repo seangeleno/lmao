@@ -890,8 +890,8 @@ class UltraSmartStrategy(IStrategy):
         ema_spread = np.where(dataframe['ema_34'] > 0,
                              (dataframe['ema_5'] - dataframe['ema_34']) / dataframe['ema_34'] * 100,
                              0)
-        ema_spread_series = self._safe_series(ema_spread, len(dataframe))
-        ema_spread_change = ema_spread - ema_spread_series.shift(3)  # 发散度变化
+        ema_spread_series = self._safe_series(ema_spread, len(dataframe), index=dataframe.index)
+        ema_spread_change = ema_spread_series - ema_spread_series.shift(3)  # 发散度变化
         
         # 3. ADX动态变化（趋势强化信号）
         adx_slope = dataframe['adx'] - dataframe['adx'].shift(3)  # ADX变化率
@@ -902,7 +902,7 @@ class UltraSmartStrategy(IStrategy):
         volume_trend = np.where(volume_20_mean != 0,
                                dataframe['volume'].rolling(5).mean() / volume_20_mean,
                                1.0)  # 如果20日均量为0，返回1.0（中性）
-        volume_trend_series = self._safe_series(volume_trend, len(dataframe))
+        volume_trend_series = self._safe_series(volume_trend, len(dataframe), index=dataframe.index)
         volume_momentum = volume_trend_series - volume_trend_series.shift(2).fillna(0)
         
         # 5. 价格加速度（二阶导数）
@@ -910,7 +910,7 @@ class UltraSmartStrategy(IStrategy):
         price_velocity = np.where(close_shift_3 != 0,
                                  (dataframe['close'] / close_shift_3 - 1) * 100,
                                  0)  # 一阶导数
-        price_velocity_series = self._safe_series(price_velocity, len(dataframe))
+        price_velocity_series = self._safe_series(price_velocity, len(dataframe), index=dataframe.index)
         price_acceleration = price_velocity_series - price_velocity_series.shift(2).fillna(0)
         
         # === 综合趋势强度评分 ===
@@ -4102,14 +4102,47 @@ class UltraSmartStrategy(IStrategy):
             logger.error(f"获取指标数据失败 {pair}: {e}")
             return DataFrame()
 
-    def _safe_series(self, data, length: int, fill_value=0) -> pd.Series:
+    def _safe_series(self, data, length: int, fill_value=0, index=None) -> pd.Series:
         """安全创建Series，避免索引重复问题"""
+        if index is None:
+            index = range(length)
+        
         if isinstance(data, (int, float)):
-            return pd.Series([data] * length, index=range(length))
+            return pd.Series([data] * length, index=index)
         elif hasattr(data, '__len__') and len(data) == length:
-            return pd.Series(data, index=range(length))
+            return pd.Series(data, index=index)
         else:
-            return pd.Series([fill_value] * length, index=range(length))
+            return pd.Series([fill_value] * length, index=index)
+    
+    def _safe_get_bool_series(self, dataframe: DataFrame, column: str, default_value: bool = False) -> pd.Series:
+        """安全获取布尔系列，确保索引对齐"""
+        try:
+            result = dataframe.get(column, default_value)
+            if isinstance(result, pd.Series):
+                # 确保索引对齐
+                result = result.reindex(dataframe.index, fill_value=default_value)
+                return result.astype(bool)
+            else:
+                # 如果返回的是标量，创建对应长度的Series
+                return pd.Series([bool(result)] * len(dataframe), index=dataframe.index)
+        except:
+            # 如果出现任何错误，返回默认值Series
+            return pd.Series([default_value] * len(dataframe), index=dataframe.index)
+    
+    def _safe_get_numeric_series(self, dataframe: DataFrame, column: str, default_value: float = 0.0) -> pd.Series:
+        """安全获取数值系列，确保索引对齐"""
+        try:
+            result = dataframe.get(column, default_value)
+            if isinstance(result, pd.Series):
+                # 确保索引对齐
+                result = result.reindex(dataframe.index, fill_value=default_value)
+                return result.astype(float)
+            else:
+                # 如果返回的是标量，创建对应长度的Series
+                return pd.Series([float(result)] * len(dataframe), index=dataframe.index)
+        except:
+            # 如果出现任何错误，返回默认值Series
+            return pd.Series([default_value] * len(dataframe), index=dataframe.index)
     
     def calculate_dynamic_rsi_thresholds(self, dataframe: DataFrame) -> Dict[str, pd.Series]:
         """
@@ -4130,22 +4163,22 @@ class UltraSmartStrategy(IStrategy):
         # === 市场环境因子计算 ===
         
         # 1. 趋势强度调整因子
-        trend_strength = dataframe.get('trend_strength', self._safe_series(50, length))
-        adx_strength = dataframe.get('adx', self._safe_series(20, length))
+        trend_strength = self._safe_get_numeric_series(dataframe, 'trend_strength', 50)
+        adx_strength = self._safe_get_numeric_series(dataframe, 'adx', 20)
         
         # 强趋势时放宽阈值 (避免在趋势中过早出场)
         strong_trend_mask = (trend_strength > 60) | (adx_strength > 30)
         trend_adjustment = np.where(strong_trend_mask, 10, 0)  # 强趋势+10
         
         # 2. 波动率调整因子
-        volatility = dataframe.get('atr_p', self._safe_series(0.02, length))
+        volatility = self._safe_get_numeric_series(dataframe, 'atr_p', 0.02)
         volatility_percentile = volatility.rolling(50).rank(pct=True)
         
         # 高波动时收紧阈值 (减少噪音造成的假信号)
         volatility_adjustment = (volatility_percentile - 0.5) * 10  # -5到+5的调整
         
         # 3. 市场环境调整
-        market_sentiment = dataframe.get('market_sentiment', self._safe_series(0, length))
+        market_sentiment = self._safe_get_numeric_series(dataframe, 'market_sentiment', 0)
         
         # 极端情绪时更严格的阈值
         extreme_fear_mask = market_sentiment < -0.7
@@ -4154,7 +4187,7 @@ class UltraSmartStrategy(IStrategy):
                                       np.where(extreme_greed_mask, 5, 0))  # 极度贪婪时提高超买阈值
         
         # 4. 成交量环境调整
-        volume_ratio = dataframe.get('volume_ratio', self._safe_series(1, length))
+        volume_ratio = self._safe_get_numeric_series(dataframe, 'volume_ratio', 1)
         high_volume_mask = volume_ratio > 2.0  # 异常放量
         volume_adjustment = np.where(high_volume_mask, 5, 0)  # 异常放量时更保守
         
@@ -5577,7 +5610,7 @@ class UltraSmartStrategy(IStrategy):
         long_favourable_environment = (
             basic_env &  # 基础环境良好
             (dataframe['trend_strength'] > -40) &  # 趋势不过度弱势（放宽）
-            (dataframe.get('market_sentiment', 0) > -0.8) &  # 情绪不过度悲观（放宽）
+            (self._safe_get_numeric_series(dataframe, 'market_sentiment', 0) > -0.8) &  # 情绪不过度悲观（放宽）
             (dataframe['rsi_14'] > 25)  # RSI不在极端超卖（避免接飞刀）
         )
         
@@ -5585,7 +5618,7 @@ class UltraSmartStrategy(IStrategy):
         short_favourable_environment = (
             basic_env &  # 基础环境良好
             (dataframe['trend_strength'] < 40) &   # 趋势不过度强势（放宽）
-            (dataframe.get('market_sentiment', 0) < 0.8) &   # 情绪不过度乐观（放宽）
+            (self._safe_get_numeric_series(dataframe, 'market_sentiment', 0) < 0.8) &   # 情绪不过度乐观（放宽）
             (dataframe['rsi_14'] < 75)  # RSI不在极端超买（避免在底部做空）
         )
         
@@ -5611,8 +5644,8 @@ class UltraSmartStrategy(IStrategy):
         # 🎯 Signal 1: RSI超卖反弹（增强动态版）
         # === 使用新的动态RSI阈值系统 ===
         # 基于趋势强度、波动率、市场情绪等多重因子计算的智能阈值
-        dynamic_oversold = dataframe.get('rsi_oversold_dynamic', 25)
-        dynamic_overbought = dataframe.get('rsi_overbought_dynamic', 75)
+        dynamic_oversold = self._safe_get_numeric_series(dataframe, 'rsi_oversold_dynamic', 25)
+        dynamic_overbought = self._safe_get_numeric_series(dataframe, 'rsi_overbought_dynamic', 75)
         
         # === 多重确认机制（增强版）===
         rsi_condition = (dataframe['rsi_14'] < dynamic_oversold)
@@ -5637,7 +5670,7 @@ class UltraSmartStrategy(IStrategy):
         )
         
         # === 背离检测：避免在顶背离时入场 ===
-        no_bearish_divergence = ~dataframe.get('bearish_divergence', False).astype(bool)
+        no_bearish_divergence = ~self._safe_get_bool_series(dataframe, 'bearish_divergence', False)
         
         rsi_oversold_bounce = (
             rsi_condition &
@@ -5670,8 +5703,8 @@ class UltraSmartStrategy(IStrategy):
             (~strong_ema_golden) &  # 排除已经是强信号的
             (dataframe['close'] <= dataframe['ema_8'] * 1.01) &  # 价格回调到EMA8附近
             (dataframe['close'] > dataframe['ema_21']) &         # 但仍在EMA21上方
-            (dataframe.get('momentum_exhaustion_score', 0) < 0.5) &  # 动量未衰竭
-            (~dataframe.get('bearish_divergence', False).astype(bool))   # 无顶背离
+            (self._safe_get_numeric_series(dataframe, 'momentum_exhaustion_score', 0) < 0.5) &  # 动量未衰竭
+            (~self._safe_get_bool_series(dataframe, 'bearish_divergence', False))   # 无顶背离
         )
         
         # 合并强信号和经过额外确认的中等信号
@@ -5810,7 +5843,7 @@ class UltraSmartStrategy(IStrategy):
         )
         
         # === 背离检测：避免在底背离时入场 ===
-        no_bullish_divergence = ~dataframe.get('bullish_divergence', False).astype(bool)
+        no_bullish_divergence = ~self._safe_get_bool_series(dataframe, 'bullish_divergence', False)
         
         rsi_overbought_fall = (
             rsi_condition &
@@ -5877,8 +5910,8 @@ class UltraSmartStrategy(IStrategy):
             (~strong_ema_death) &  # 排除已经是强信号的
             (dataframe['close'] >= dataframe['ema_8'] * 0.99) &  # 价格反弹到EMA8附近
             (dataframe['rsi_14'] < 45) &                         # RSI偏低，反弹空间大
-            (dataframe.get('momentum_exhaustion_score', 0) < 0.6) &  # 动量未完全衰竭
-            (dataframe.get('bullish_divergence', False).astype(bool) | (dataframe['rsi_14'] < 35))  # 底背离或超卖
+            (self._safe_get_numeric_series(dataframe, 'momentum_exhaustion_score', 0) < 0.6) &  # 动量未完全衰竭
+            (self._safe_get_bool_series(dataframe, 'bullish_divergence', False) | (dataframe['rsi_14'] < 35))  # 底背离或超卖
         )
         
         # 反转逻辑：死叉后的反弹做多
@@ -5995,7 +6028,7 @@ class UltraSmartStrategy(IStrategy):
         )
         
         # 7. 背离保护：避免在底背离时做空
-        no_bullish_divergence = ~dataframe.get('bullish_divergence', False).astype(bool)
+        no_bullish_divergence = ~self._safe_get_bool_series(dataframe, 'bullish_divergence', False)
         
         # === 最终MACD看跌信号（强化过滤版） ===
         macd_bearish = (
@@ -6314,7 +6347,7 @@ class UltraSmartStrategy(IStrategy):
             # 成交量异常放大（恐慌后买盘）
             (dataframe['volume_ratio'] > 2.0) &
             # 反转信号强烈
-            (dataframe.get('reversal_signal_strength', 0) > 25) &
+            (self._safe_get_numeric_series(dataframe, 'reversal_signal_strength', 0) > 25) &
             # MACD底背离
             (dataframe['macd_hist'] > dataframe['macd_hist'].shift(1)) &
             long_favourable_environment
@@ -6625,7 +6658,7 @@ class UltraSmartStrategy(IStrategy):
             # 成交量异常放大（获利回吐）
             (dataframe['volume_ratio'] > 2.0) &
             # 反转信号强烈
-            (dataframe.get('reversal_signal_strength', 0) < -25) &
+            (self._safe_get_numeric_series(dataframe, 'reversal_signal_strength', 0) < -25) &
             # MACD顶背离
             (dataframe['macd_hist'] < dataframe['macd_hist'].shift(1)) &
             # 价格创新高但指标背离
