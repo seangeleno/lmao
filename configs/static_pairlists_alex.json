@@ -4,6 +4,7 @@
   "stake_currency": "USDT",
   "tradable_balance_ratio": 1,
   "dry_run_wallet": 100,
+  "stake_amount": "unlimited",
   "fiat_display_currency": "USD",
   "enable_dp": true,
   "timeframe": "1h",
