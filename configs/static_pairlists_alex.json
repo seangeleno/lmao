@@ -278,8 +278,8 @@
     "jwt_secret_key": "",
     "ws_token": "",
     "CORS_origins": [""],
-    "username": "",
-    "password": ""
+    "username": "qninhdt",
+    "password": "123456"
   },
   "bot_name": "alex",
   "initial_state": "running",
