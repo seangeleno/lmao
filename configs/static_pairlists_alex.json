@@ -1,8 +1,7 @@
 {
   "position_adjustment_enable": true,
-  "max_open_trades": 20,
+  "max_open_trades": 10,
   "stake_currency": "USDT",
-  "stake_amount": 20,
   "tradable_balance_ratio": 1,
   "dry_run_wallet": 100,
   "fiat_display_currency": "USD",
@@ -60,14 +59,8 @@
   "exchange": {
     "name": "binance",
     "position_adjustment_enable": true,
-    "max_open_trades": 20,
-    "stake_currency": "USDT",
-    "stake_amount": 20,
-    "tradable_balance_ratio": 1,
-    "dry_run_wallet": 100,
     "fiat_display_currency": "USD",
     "enable_dp": true,
-    "timeframe": "1h",
     "data_directory": "user_data/data",
     "informative_timeframes": {
       "15m": ["close", "high", "low", "volume"],
