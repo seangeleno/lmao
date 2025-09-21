@@ -49,7 +49,7 @@
       "(GT|HT|MOB|PNT|DERP|GAL|DOCK|POLS|BAND|MDX|FLM|ARDR|ORN|JST|HMSTR|BEL|XTZ|REN|GFT|IRIS|OAX|KEY|EOS|DAR|XVG|SAND|IDEX|SCR|PIVX|AIXBT)/.*",
       "(WBTC|BSV|BTCDOM|DEFI)/.*",
       "(AUD|BRZ|CAD|CHF|EUR|GBP|HKD|IDRT|JPY|NGN|RUB|SGD|TRY|UAH|USD|ZAR|UST)/.*",
-      "(USDE|BUSD|CUSDT|DAI|PAX|PAXG|SUSD|TUSD|USDC|USDT|VAI|USDN|USDP|FDUSD|EURI)/.*"
+      "(BFUSD|USDE|BUSD|CUSDT|DAI|PAX|PAXG|SUSD|TUSD|USDC|USDT|VAI|USDN|USDP|FDUSD|EURI)/.*"
     ]
   },
   "pairlists": [],
@@ -97,8 +97,8 @@
     "listen_ip_address": "0.0.0.0",
     "listen_port": 8080,
     "verbosity": "info",
-    "jwt_secret_key": "somethingrandom",
-    "CORS_origins": [],
+    "jwt_secret_key": "keke",
+    "CORS_origins": ["*"],
     "username": "qninhdt",
     "password": "123456"
   },

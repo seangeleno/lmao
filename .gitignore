@@ -228,3 +228,4 @@ __marimo__/
 pair_performance.csv
 ml_models
 optuna_studies
+models
