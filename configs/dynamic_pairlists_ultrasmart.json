@@ -1,0 +1,12 @@
+{
+  "add_config_files": ["./base.json"],
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "pairlists": [
+    {
+      "method": "VolumePairList",
+      "number_assets": 100,
+      "sort_key": "quoteVolume"
+    }
+  ]
+}
