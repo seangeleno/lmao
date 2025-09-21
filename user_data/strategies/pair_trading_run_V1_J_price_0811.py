@@ -14,6 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+#  Discord real-time push for this strategy, welcome to join: https://discord.gg/3EABfUPxbQ
 class pair_trading_run_V1_J_price_0811(IStrategy):
     can_short = True
     timeframe = "5m"
@@ -26,11 +27,11 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
     Zscore_entry = 1  # Z-score entry threshold
     Zscore_entry1 = 1.1 * Zscore_entry  # Z-score entry threshold 1.1x
     Zscore_exit = 0.8  # Z-score exit threshold
-    Zscore_stop = 3  # Z-score stop loss threshold (loss exit)
+    Zscore_stop = 3  # Z-score stop loss threshold (loss close)
     can_trade_usdt = False
     min_consistency_score = 0.0002
     zscore_mean_window = 10  # Z-score mean calculation window
-    zscore_abs_max_window = 100  # Z-score absolute maximum value calculation window
+    zscore_abs_max_window = 100  # Z-score absolute maximum calculation window
     leverage1 = 10
 
     # order_types = {
@@ -47,6 +48,8 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
     def __init__(self, config):
         super().__init__(config)
+        # self.free_usdt = 0
+        # self.free_usdt = 0.5 * self.free_usdt  # Assume 60% of USDT is available
         self.whitelist = config.get("exchange", {}).get("pair_whitelist", [])
         self.pvalue_dict = config.get("pvalue_dict", {})
         self.gamma_dict = config.get("gamma_dict", {})
@@ -62,17 +65,19 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         self.tradable_pairs = {}
         self.stake_allocations = {}
         self.pair_states = {}
-        ### Modification: Add a timer to update pair pool every 4 hours
+        ### Update: Add a timer to update the pair pool every 4 hours
         self.last_update_time = datetime(1945, 8, 15, tzinfo=timezone.utc)
-        self.update_interval = timedelta(days=1)
+        self.update_interval = timedelta(days=30)
 
     def _initialize_all_candidates(self) -> list:
-        logger.info(len(self.pair_states))
+
         pvalue_filtered = {k: v for k, v in self.pvalue_dict.items() if v <= 0.0001}
         logger.info(f"Remaining pairs after p-value filtering: {len(pvalue_filtered)}")
-        logger.info(f"First 5 pvalue_filtered: {list(pvalue_filtered.items())[:5]}")
+        logger.info(
+            f"First 5 pvalue_filtered pairs: {list(pvalue_filtered.items())[:5]}"
+        )
 
-        # Filter pairs based on zmean on top of pvalue_filtered
+        # Filter pairs based on zmean from pvalue_filtered
         zmean_filtered = {}
         for p_key, pvalue in pvalue_filtered.items():
             try:
@@ -88,9 +93,9 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 logger.error(f"Error during zmean filtering: {e} for key {p_key}")
                 continue
         logger.info(f"Remaining pairs after zmean filtering: {len(zmean_filtered)}")
-        logger.info(f"First 5 zmean_filtered: {list(zmean_filtered.items())[:5]}")
+        logger.info(f"First 5 zmean_filtered pairs: {list(zmean_filtered.items())[:5]}")
 
-        # Filter pairs based on z_cross_zero_count on top of zstd_filtered
+        # Filter pairs based on z_cross_zero_count from zstd_filtered
         z_cross_zero_count_filtered = {}
         for p_key, pvalue in zmean_filtered.items():
             try:
@@ -103,7 +108,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 # Filter based on z_cross_zero_count value
                 if (
                     z_cross_zero_count_value is not None
-                    and z_cross_zero_count_value >= 200
+                    and z_cross_zero_count_value >= 1000
                 ):
                     z_cross_zero_count_filtered[p_key] = pvalue
 
@@ -116,11 +121,10 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             f"Remaining pairs after z_cross_zero_count filtering: {len(z_cross_zero_count_filtered)}"
         )
         logger.info(
-            f"First 5 z_cross_zero_count_filtered: {list(z_cross_zero_count_filtered.items())[:5]}"
+            f"First 5 z_cross_zero_count_filtered pairs: {list(z_cross_zero_count_filtered.items())[:5]}"
         )
-        # z_cross_zero_count_filtered = zmean_filtered
 
-        # Filter pairs based on adf on top of z_cross_zero_count_filtered
+        # Filter pairs based on adf from z_cross_zero_count_filtered
         adfstat_filtered = {}
         for p_key, pvalue in z_cross_zero_count_filtered.items():
             try:
@@ -128,7 +132,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 adfstat_key = f"{a_key}_{b_key}_adfstat"
                 adfstat_value = self.adfstat_dict.get(adfstat_key)
 
-                # ADF statistic needs to be less than critical value (more negative) to be considered stationary.
+                # ADF statistic needs to be less than critical value (more negative) to consider series stationary.
                 # -3.0 is an empirical strict threshold.
                 if adfstat_value is not None and adfstat_value < -3.0:
                     adfstat_filtered[p_key] = pvalue
@@ -137,9 +141,11 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 logger.error(f"Error during adf filtering: {e} for key {p_key}")
                 continue
         logger.info(f"Remaining pairs after adf filtering: {len(adfstat_filtered)}")
-        logger.info(f"First 5 adfstat_filtered: {list(adfstat_filtered.items())[:5]}")
+        logger.info(
+            f"First 5 adfstat_filtered pairs: {list(adfstat_filtered.items())[:5]}"
+        )
 
-        # Filter pairs based on half_life on top of adfstat_filtered
+        # Filter pairs based on half_life from adfstat_filtered
         half_life_filtered = {}
         for p_key, pvalue in adfstat_filtered.items():
             try:
@@ -148,6 +154,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 half_life_value = self.half_life_dict.get(half_life_key)
 
                 # Filter based on half_life value
+                # if half_life_value is not None and half_life_value < 2000:
                 if half_life_value is not None and half_life_value < 700:
                     half_life_filtered[p_key] = pvalue
 
@@ -158,11 +165,11 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             f"Remaining pairs after half_life filtering: {len(half_life_filtered)}"
         )
         logger.info(
-            f"First 5 half_life_filtered: {list(half_life_filtered.items())[:5]}"
+            f"First 5 half_life_filtered pairs: {list(half_life_filtered.items())[:5]}"
         )
 
         candidates = []
-        max_pairs = self.config.get("max_open_trades", 1) / 2
+        balance = self.wallets.get_total("USDT")
         for p_key, pvalue in half_life_filtered.items():
             try:
                 a_key, b_key = p_key.replace("_pvalue", "").split("_")
@@ -189,28 +196,23 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
                 # 2. Use dollar neutrality method to calculate target position value
                 #    This method is the correct algorithm that matches the log price regression model
-                #    Formula: Stake_B = Budget / (gamma + 1), Stake_A = Budget - Stake_B
+                #    公式: Stake_B = Budget / (gamma + 1), Stake_A = Budget - Stake_B
                 if (gamma + 1) <= 0:
                     continue  # Avoid division by zero or negative numbers
 
-                target_stake_B = (
-                    self.wallets.get_total(self.stake_currency)
-                    / max_pairs
-                    / (gamma + 1)
-                )
-                target_stake_A = (
-                    self.wallets.get_total(self.stake_currency) / max_pairs
-                    - target_stake_B
-                )
+                # target_stake_B = self.free_usdt / (gamma + 1)
+                # target_stake_A = self.free_usdt - target_stake_B
+                target_stake_B = balance / (gamma + 1)
+                target_stake_A = balance - target_stake_B
 
-                # 3. Check if position value meets minimum requirements (independent of leverage!)
+                # 3. Check if position value meets minimum requirements (leverage independent!)
                 if target_stake_A < MIN_STAKE_USDT or target_stake_B < MIN_STAKE_USDT:
                     continue
 
                 half_key = f"{a_key}_{b_key}_half_life"
                 half_life = self.half_life_dict.get(half_key)
 
-                ### Modification
+                ### 修改
                 candidates.append(
                     {
                         "raw_pair_key": f"{a_key}_{b_key}",
@@ -222,12 +224,12 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                     }
                 )
             except Exception as e:
-                logger.error(f"Error preloading data: {e} for key {p_key}")
+                logger.error(f"Error during data preloading: {e} for key {p_key}")
 
-        # Sort by half-life in ascending order
+        # 按照半衰期升序排序
         logger.info(f"Number of pairs before price filtering: {len(candidates)}")
         candidates = sorted(candidates, key=lambda x: x["half_life"], reverse=False)
-        # Remove duplicate currencies. If A-B pair appears before, remove later B-C pairs
+        # 前面已经出现过的币种，后面直接删除掉改配对，例如出现过A-B，后面出现的B-C就不需要了
         seen_currencies = set()
         filtered_candidates = []
         for candidate in candidates:
@@ -241,17 +243,19 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             filtered_candidates.append(candidate)
         # logger.info(f"Number of pairs after filtering: {len(filtered_candidates)}")
         candidates = filtered_candidates
-        logger.info(f"After removing duplicate currencies: {len(candidates)}")
+        logger.info(
+            f"Number of pairs after removing duplicate currencies: {len(candidates)}"
+        )
         return candidates
         # return candidates
 
     def _update_tradable_pairs(self):
-        logger.warning(f"Dynamic pair pool update triggered...")
+        logger.warning(f"Triggering dynamic pair pool update...")
         open_trades = Trade.get_trades_proxy(is_open=True)
         new_tradable_pairs = {}
         locked_currencies = set()
 
-        # 1. Unconditionally retain and lock existing position pairs
+        # 1. 无条件保留并锁定已有持仓的配对
         for trade in open_trades:
             if not trade.enter_tag:
                 continue
@@ -273,25 +277,25 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                     )[0]
                     locked_currencies.add(pair_A_base)
                     locked_currencies.add(pair_B_base)
-                    # logger.info(f"Retain existing position pair {trade_pair_key}, and lock currencies: {pair_A_base}, {pair_B_base}")
+                    # logger.info(f"Keeping existing position pair {trade_pair_key}, locking currencies: {pair_A_base}, {pair_B_base}")
             except Exception as e:
                 logger.error(f"Error processing existing positions: {e}")
         logger.info(f"Number of existing position pairs: {len(new_tradable_pairs)}")
-        # 2. Greedy selection to fill remaining slots
+        # 2. 贪婪选择，填充剩余名额
         max_allowed_pairs = (self.config.get("max_open_trades", 1)) / 2
         logger.info(
-            f"Maximum allowed tradable pairs from maxopentrade: {max_allowed_pairs}"
+            f"Maximum tradable pairs allowed by maxopentrade: {max_allowed_pairs}"
         )
-        logger.info(
-            f"Number of pairs after initial filtering: {len(new_tradable_pairs)}"
-        )
+        logger.info(f"Number of initially filtered pairs: {len(new_tradable_pairs)}")
         logger.info(
             f"Number of pairs after filter function screening: {len(self.all_candidate_pairs)}"
         )
         for candidate in self.all_candidate_pairs:
-            # logger.info(f"Check candidate pair: {candidate['raw_pair_key']} ")
+            # logger.info(f"Checking candidate pair: {candidate['raw_pair_key']} ")
             if len(new_tradable_pairs) >= max_allowed_pairs:
-                logger.info(f"Reached maximum tradable pair count: {max_allowed_pairs}")
+                logger.info(
+                    f"Reached maximum tradable pairs limit: {max_allowed_pairs}"
+                )
                 break
 
             pair_A_base = candidate["pair_A"].split("/")[0]
@@ -321,26 +325,28 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 locked_currencies.add(pair_B_base)
                 # logger.info(f"Dynamically selected new pair {pair_key_sorted} (consistency score: {candidate['consistency_score']:.2f})")
 
-        # 3. Atomically update tradable_pairs and fund allocation
+        # self.tradable_pairs = new_tradable_pairs
+        # self._allocate_stake_amounts()
+        # logger.info(f"Updated tradable pairs count: {len(self.tradable_pairs)}")
+
+        # 3. 原子化地更新 tradable_pairs 和资金分配
         self.tradable_pairs = new_tradable_pairs
-        logger.info(
-            f"Number of tradable pairs after update: {len(self.tradable_pairs)}"
-        )
+        logger.info(f"更新后的可交易配对数量: {len(self.tradable_pairs)}")
 
         if len(self.tradable_pairs) > 0:
-            capital_per_pair = self.wallets.get_total(self.stake_currency) / len(
-                self.tradable_pairs
-            )
+            # capital_per_pair = self.free_usdt / len(self.tradable_pairs)
+            # capital_per_pair = self.free_usdt / 6
+            capital_per_pair = self.wallets.get_total("USDT") / len(self.tradable_pairs)
             self.stake_allocations = {
                 key: capital_per_pair for key in self.tradable_pairs
             }
         else:
             self.stake_allocations = {}
-        # logger.info(f"Fund allocation: {self.stake_allocations}")
+        # logger.info(f"Stake allocation: {self.stake_allocations}")
         logger.warning(
             f"Dynamic pair pool update completed. Current tradable pairs: {list(self.tradable_pairs.keys())}"
         )
-        logger.warning(f"Current tradable pairs are: {self.tradable_pairs}")
+        logger.warning(f"Current tradable pairs: {self.tradable_pairs}")
 
     def populate_indicators(
         self, dataframe: pd.DataFrame, metadata: dict
@@ -348,7 +354,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         current_time = dataframe.iloc[-1]["date"].to_pydatetime()
         if current_time >= self.last_update_time + self.update_interval:
             # self.free_usdt = 0.6 * self.wallets.get_total("USDT")
-            # self.free_usdt = self.wallets.get_total(self.stake_currency)
+            # self.free_usdt = 0.6 * 2000
             self.all_candidate_pairs = self._initialize_all_candidates()
             self._update_tradable_pairs()
             self.last_update_time = current_time
@@ -362,14 +368,14 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         dataframe["-0.8"] = -0.8
         dataframe["0.8"] = 0.8
 
-        # Collect all new columns
+        # 收集所有新列
         new_columns = {}
 
         for pair in self.whitelist:
             pair_df = self.dp.get_pair_dataframe(pair=pair, timeframe=self.timeframe)
             new_columns[f"{pair}_log_close"] = pair_df["close"]
 
-        # Calculate Z-score columns for each pair
+        # 为每个配对计算 Z-score 列
         for pair_key_str, params in self.tradable_pairs.items():
             pair_A = params["pair_A"]
             pair_B = params["pair_B"]
@@ -395,7 +401,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                         window=self.zscore_mean_window
                     ).mean()
 
-        # Add all new columns at once
+        # 一次性添加所有新列
         if new_columns:
             new_df = pd.DataFrame(new_columns, index=dataframe.index)
             dataframe = pd.concat([dataframe, new_df], axis=1)
@@ -473,19 +479,18 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
                 zscore = dataframe[zscore_col_name]
                 open_trades = Trade.get_trades_proxy(is_open=True)
-                # Calculate profit for pairs A and B
+                # 计算配对A和B的收益
                 trade_A = next((t for t in open_trades if t.pair == pair_A), None)
                 trade_B = next((t for t in open_trades if t.pair == pair_B), None)
 
                 profit_A = self.get_trade_profit(trade_A) if trade_A else 0.0
                 profit_B = self.get_trade_profit(trade_B) if trade_B else 0.0
 
-                # Check if profit is greater than 0
-                # pair_profit_ratio = (profit_A + profit_B) / ((0.6 * self.wallets.get_total('USDT')) / 6)
+                # 判断收益是否大于0
                 pair_profit_ratio = (profit_A + profit_B) / (
-                    self.wallets.get_total(self.stake_currency)
-                    / len(self.tradable_pairs)
+                    (self.wallets.get_total("USDT")) / len(self.tradable_pairs)
                 )
+                # pair_profit_ratio = (profit_A + profit_B) / (0.6 * 2000 / 6)
                 # profit_condition = pair_profit_ratio > 0
 
                 # exit_cond = (abs(zscore) < self.Zscore_exit) & profit_condition
@@ -505,6 +510,17 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         current_profit: float,
         **kwargs,
     ):
+        # logger.info(f"--- [custom_exit] for {pair} at {current_time} ---")
+        if current_time >= self.last_update_time + self.update_interval:
+            # self.free_usdt = 0.6 * self.wallets.get_total('USDT')
+            # self.free_usdt = 0.6 * 2000
+            # self.all_candidate_pairs = self._initialize_all_candidates()
+            # self._update_tradable_pairs()
+            # self.last_update_time = current_time
+            # logger.info(
+            #    f"+++++++++++++++++++++++Updated tradable pairs at custom_exit time {current_time},last_update_time: {self.last_update_time}+++++++++++++++++++++++ ")
+            pass
+
         open_trades = Trade.get_trades_proxy(is_open=True)
         all_profits = {}
         total_profit_amount = 0.0
@@ -534,6 +550,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 f"{profit_pct:.2f}% ({profit_amount:.2f} {open_trade.stake_currency})"
             )
         ratio = total_profit_amount / self.wallets.get_total("USDT")
+        # ratio = total_profit_amount / 2000
         # logger.info(f"log_____total_profit_amount:{total_profit_amount},ratio:{ratio}")
         if ratio <= -1:
             logger.info(
@@ -555,7 +572,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         if not trade_candle.empty:
             trade_candle = trade_candle.iloc[0]
         else:
-            # No corresponding K-line found, can choose continue or return None
+            # 没有找到对应K线，可以选择continue或return None
             return None
         current_candle = dataframe.iloc[-1].squeeze()
         current_pair = pair
@@ -563,7 +580,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             pair_A = params["pair_A"]
             pair_B = params["pair_B"]
             zscore_col_name = f"{pair_A}_{pair_B}_Zscore"
-            # 1. Z-score exit
+            # 1. z分数退出
             if zscore_col_name in dataframe.columns and (
                 current_pair == pair_A or current_pair == pair_B
             ):
@@ -574,13 +591,13 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
             trade_A = next((t for t in open_trades if t.pair == pair_A), None)
             trade_B = next((t for t in open_trades if t.pair == pair_B), None)
-            # Update floating profit
+            # 更新浮动利润
             profit_A = self.get_trade_profit(trade_A) if trade_A else 0.0
             profit_B = self.get_trade_profit(trade_B) if trade_B else 0.0
+            # pair_profit_ratio = (profit_A + profit_B) / ((0.6 * self.wallets.get_total('USDT')) / len(self.tradable_pairs))
             pair_profit_ratio = (profit_A + profit_B) / (
-                (self.wallets.get_total("USDT")) / len(self.tradable_pairs)
+                self.wallets.get_total("USDT") / len(self.tradable_pairs)
             )
-            # pair_profit_ratio = (profit_A + profit_B) / ( self.wallets.get_total('USDT') / 6)
             state = self.pair_states.get(pair_key)
 
             # logger.info(f"Pair {pair_key} profit ratio: {pair_profit_ratio:.2%} (A: {profit_A:.2f}, B: {profit_B:.2f})")
@@ -623,7 +640,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         fee = 1
         price_A_with_fee = pair_A_price * fee
         price_B_with_fee = pair_B_price * fee
-        min_usdt = 6.0 / self.leverage1
+        min_usdt = 1.0 * len(self.tradable_pairs) / self.leverage1
 
         market_A = self.dp.market(pair_A)
         market_B = self.dp.market(pair_B)
@@ -718,10 +735,10 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         **kwargs,
     ) -> float:
         logger.info(
-            f"----------------------------------------Buy log start---------------------------------------"
+            f"----------------------------------------Buy Log Start---------------------------------------"
         )
         logger.info(
-            f"Calculate position for pair {pair}, current time: {current_time},current_rate{current_rate}"
+            f"Calculating position for pair {pair}, current time: {current_time}, current_rate: {current_rate}"
         )
         if not entry_tag:
             return 0.0
@@ -736,12 +753,12 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         ):
             return 0.0
 
-        # Get pair state, empty dict if not exists
+        # 获取配对状态，如果不存在则为空字典
         state = self.pair_states.get(pair_key)
 
         if not state:
             budget = self.stake_allocations[pair_key]
-            # logger.info(f"Calculate pair {pair_key} position, budget: ${budget:.2f}")
+            # logger.info(f"计算配对 {pair_key} 的仓位，预算: ${budget:.2f}")
             params = self.tradable_pairs[pair_key]
             pair_A = params["pair_A"]
             pair_B = params["pair_B"]
@@ -764,14 +781,14 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             logger.info(
                 f"B:dataframe open{dataframe_B.iloc[-1]['open']} close:{dataframe_B.iloc[-1]['close']}"
             )
-            logger.info(f"pair_A_price {pair_A_price} ，pair_B_price{pair_B_price}")
+            logger.info(f"pair_A_price {pair_A_price}, pair_B_price{pair_B_price}")
 
             stakes = self._calculate_precise_stakes(
                 pair_key, budget, pair_A_price, pair_B_price
             )
             if stakes["A_amount"] <= 0 or stakes["B_amount"] <= 0:
                 logger.warning(
-                    f"Pair {pair_key} calculated position invalid: A leg: {stakes['A_amount']}, B leg: {stakes['B_amount']}"
+                    f"Invalid calculated position for pair {pair_key}: A leg: {stakes['A_amount']}, B leg: {stakes['B_amount']}"
                 )
                 return 0.0
 
@@ -793,8 +810,8 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             if pair == pair_A
             else (state["B_amount"] * current_rate)
         )
-        # logger.info(f"当前配对状态: {pair_key}: {self.pair_states[pair_key]}")
-        logger.info(f"Buy amount {stake_to_return}")
+        # logger.info(f"Current pair status: {pair_key}: {self.pair_states[pair_key]}")
+        logger.info(f"Buy amount: {stake_to_return}")
         return stake_to_return
 
     def custom_entry_price(
@@ -810,7 +827,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         last_time = dataframe.iloc[-1]["date"].to_pydatetime()
 
         logger.info(
-            f"Custom entry price function calculates buy price for pair {pair}, current time: {current_time}, previous time: {last_time}, proposed_rate: {proposed_rate}, pair_price: {pair_price}"
+            f"Custom entry price function calculating buy price for pair {pair}, current time: {current_time}, last time: {last_time}, proposed_rate: {proposed_rate}, pair_price: {pair_price}"
         )
         return pair_price
 
@@ -829,7 +846,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         last_time = dataframe.iloc[-1]["date"].to_pydatetime()
 
         logger.info(
-            f"Custom exit price function calculates sell price for pair {pair}, current time: {current_time}, previous time: {last_time}, proposed_rate: {proposed_rate}, pair_price: {pair_price}"
+            f"Custom exit price function calculating sell price for pair {pair}, current time: {current_time}, last time: {last_time}, proposed_rate: {proposed_rate}, pair_price: {pair_price}"
         )
         return pair_price
 
@@ -844,7 +861,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         **kwargs,
     ) -> bool:
         logger.info(
-            f"Confirm buy {pair} ({side}), order type: {order_type}, quantity: {amount}, price: {rate}, time validity: {time_in_force}"
+            f"Confirming buy {pair} ({side}), order type: {order_type}, quantity: {amount}, price: {rate}, time in force: {time_in_force}"
         )
         dataframe, _ = self.dp.get_analyzed_dataframe(
             pair=pair, timeframe=self.timeframe
@@ -853,11 +870,11 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             return False
 
         enter_tag = dataframe["enter_tag"].iloc[-1]
-        # logger.info(f"确认买入{pair} ({side})")
+        # logger.info(f"Confirming buy {pair} ({side})")
         try:
             pair_key = "_".join(enter_tag.split("_")[2:])
         except IndexError:
-            # logger.warning(f"无法从 entry_tag '{enter_tag}' 中解析出配对key。")
+            # logger.warning(f"Unable to parse pair key from entry_tag '{enter_tag}'.")
             return False
 
         state = self.pair_states.get(pair_key)
@@ -870,19 +887,19 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         if pair == pair_A and state["leg_A_opened"] == False:
             state["leg_A_opened"] = True
             logger.info(
-                f"Pair {pair_key} A leg opened successfully, state updated to: {state}"
+                f"Pair {pair_key} A leg opened successfully, status updated to: {state}"
             )
         if pair == pair_B and state["leg_B_opened"] == False:
             state["leg_B_opened"] = True
             logger.info(
-                f"Pair {pair_key} B leg opened successfully, state updated to: {state}"
+                f"Pair {pair_key} B leg opened successfully, status updated to: {state}"
             )
 
         logger.info(
-            f"Trade {pair} ({side}) opened successfully, current pair state: {state}"
+            f"Trade {pair} ({side}) opened successfully, current pair status: {state}"
         )
         logger.info(
-            f"----------------------------------------Buy log end---------------------------------------"
+            f"----------------------------------------Buy Log End---------------------------------------"
         )
         return True
 
@@ -899,14 +916,14 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
         **kwargs,
     ) -> bool:
         logger.info(
-            f"----------------------------------------Sell log start---------------------------------------"
+            f"----------------------------------------Sell Log Start---------------------------------------"
         )
         enter_tag = trade.enter_tag
-        # logger.info(f"确认买入{pair} ({side})")
+        # logger.info(f"Confirming buy {pair} ({side})")
         try:
             pair_key = "_".join(enter_tag.split("_")[2:])
         except IndexError:
-            # logger.warning(f"无法从 entry_tag '{enter_tag}' 中解析出配对key。")
+            # logger.warning(f"Unable to parse pair key from entry_tag '{enter_tag}'.")
             return False
 
         state = self.pair_states.get(pair_key)
@@ -924,7 +941,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             ):
                 state["one_pair_is_already_exit"] = 1
                 logger.info(
-                    f"-----------------------Triggered one_pair_is_already_exit set to 1---------------------"
+                    f"-----------------------Triggering one_pair_is_already_exit set to 1---------------------"
                 )
             if (
                 state["leg_A_opened"] == True
@@ -933,7 +950,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 and exit_reason == f"Pair_already_exit_{pair_A}_{pair_B}"
             ):
                 logger.info(
-                    f"-----------------------Triggered one_pair_is_already_exit set to 0---------------------"
+                    f"-----------------------Triggering one_pair_is_already_exit set to 0---------------------"
                 )
                 state["one_pair_is_already_exit"] = 0
             state["leg_A_opened"] = False
@@ -945,7 +962,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             ):
                 state["one_pair_is_already_exit"] = 1
                 logger.info(
-                    f"-----------------------Triggered one_pair_is_already_exit set to 1---------------------"
+                    f"-----------------------Triggering one_pair_is_already_exit set to 1---------------------"
                 )
             if (
                 state["leg_A_opened"] == False
@@ -954,15 +971,15 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                 and exit_reason == f"Pair_already_exit_{pair_A}_{pair_B}"
             ):
                 logger.info(
-                    f"-----------------------Triggered one_pair_is_already_exit set to 0---------------------"
+                    f"-----------------------Triggering one_pair_is_already_exit set to 0---------------------"
                 )
                 state["one_pair_is_already_exit"] = 0
             state["leg_B_opened"] = False
         logger.info(
-            f"Trade {trade.id} ({pair}) closed, close reason: {exit_reason}, close completed, current pair state: {state}, close quantity{amount}"
+            f"Trade {trade.id} ({pair}) closed, exit reason: {exit_reason}, close completed, current pair status: {state}, close quantity: {amount}"
         )
         logger.info(
-            f"------------- ---------------------------Sell log end---------------------------------------"
+            f"------------- ---------------------------Sell Log End---------------------------------------"
         )
 
         if not state["leg_A_opened"] and not state["leg_B_opened"]:
@@ -995,7 +1012,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
             pair_A = params["pair_A"]
             pair_B = params["pair_B"]
             zscore_col_name = f"{pair_A}_{pair_B}_Zscore"
-            # 1. Z-score position increase
+            # 1. z分数加仓
             last_time = trade.date_last_filled_utc + timedelta(days=3)
             if zscore_col_name in dataframe.columns and (
                 current_pair == pair_A or current_pair == pair_B
@@ -1021,7 +1038,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                     ):
                         return 0.0
 
-                    # Get pair state, empty dict if not exists
+                    # 获取配对状态，如果不存在则为空字典
                     state = self.pair_states.get(pair_key)
 
                     if not state:
@@ -1036,7 +1053,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
                         if not (leg_A_opened or leg_B_opened):
                             budget = self.stake_allocations[pair_key]
-                            # logger.info(f"计算配对 {pair_key} 的仓位，预算: ${budget:.2f}")
+                            # logger.info(f"Calculating position for pair {pair_key}, budget: ${budget:.2f}")
                             params = self.tradable_pairs[pair_key]
                             pair_A = params["pair_A"]
                             pair_B = params["pair_B"]
@@ -1059,7 +1076,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                             )
                             if stakes["A_amount"] <= 0 or stakes["B_amount"] <= 0:
                                 logger.warning(
-                                    f"adjust_trade_position pair {pair_key} calculated position invalid: A leg: {stakes['A_amount']}, B leg: {stakes['B_amount']}"
+                                    f"adjust_trade_position Invalid calculated position for pair {pair_key}: A leg: {stakes['A_amount']}, B leg: {stakes['B_amount']}"
                                 )
                                 return 0.0
 
@@ -1081,9 +1098,9 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
                         if pair == pair_A
                         else (state["B_amount"] * current_rate)
                     )
-                    # logger.info(f"当前配对状态: {pair_key}: {self.pair_states[pair_key]}")
+                    # logger.info(f"Current pair status: {pair_key}: {self.pair_states[pair_key]}")
                     logger.info(
-                        f"Current currency {pair} pair {pair_key} position increase amount: {stake_to_return:.2f} USDT"
+                        f"Current currency {pair} pair {pair_key} add position amount: {stake_to_return:.2f} USDT"
                     )
                     return stake_to_return
 
@@ -1104,7 +1121,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
     def zvalue(self, y, x, gamma, c):
         if gamma is None or c is None:
-            logger.error("gamma or c value not set, unable to calculate Z value.")
+            logger.error("Gamma or c value not set, unable to calculate Z value.")
             return None
 
         Z = y - (gamma * x + c)
@@ -1112,7 +1129,7 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
     def Yvalue(self, y, x, gamma, c):
         if gamma is None or c is None:
-            logger.error("gamma or c value not set, unable to calculate Y value.")
+            logger.error("Gamma or c value not set, unable to calculate Y value.")
             return None
 
         Y = gamma * x + c
@@ -1120,14 +1137,16 @@ class pair_trading_run_V1_J_price_0811(IStrategy):
 
     def change_y(self, y, x, gamma, c):
         """
-        Calculate percentage difference relative to y value
+        Calculate the percentage of the difference relative to y value
         """
         if gamma is None or c is None:
-            logger.error("gamma or c value not set, unable to calculate Z value.")
+            logger.error("Gamma or c value not set, unable to calculate Z value.")
             return None
 
         Y = gamma * x + c
-        y_change = (Y - y) / y * 100  # Calculate percentage difference relative to Y
+        y_change = (
+            (Y - y) / y * 100
+        )  # Calculate the percentage of the difference relative to Y
         return y_change
 
     def get_trade_profit(self, trade):

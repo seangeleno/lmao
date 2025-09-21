@@ -5,7 +5,7 @@
   "pairlists": [
     {
       "method": "VolumePairList",
-      "number_assets": 400
+      "number_assets": 200
     },
     {
       "method": "AgeFilter",

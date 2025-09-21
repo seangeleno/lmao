@@ -1,0 +1,16 @@
+{
+  "add_config_files": ["./base.json"],
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "pairlists": [
+    {
+      "method": "VolumePairList",
+      "number_assets": 300,
+      "sort_key": "quoteVolume"
+    },
+    {
+      "method": "AgeFilter",
+      "min_days_listed": 365
+    }
+  ]
+}

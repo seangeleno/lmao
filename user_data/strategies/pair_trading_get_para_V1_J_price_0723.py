@@ -43,7 +43,6 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         all_new_params = {}
         log_close_prices = {}
 
-        # --- TỐI ƯU 1: Chỉ tải cột 'close' và chuyển sang float32 ---
         # Tạo một DataFrame duy nhất chứa tất cả các giá đóng cửa cần thiết.
         close_series_list = []
         for pair in self.whitelist:
@@ -51,7 +50,7 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
             # và chuyển đổi kiểu dữ liệu để tiết kiệm bộ nhớ
             close_data = self.dp.get_pair_dataframe(pair, self.timeframe)[
                 "close"
-            ].astype(np.float32)
+            ].astype(np.float64)
             close_data.name = pair  # Đặt tên cho Series để sau này join
             close_series_list.append(close_data)
 
@@ -64,7 +63,9 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
                 log_close_prices[f"{pair}_log_close"] = all_closes_df[pair].iloc[-1]
 
         # --- TỐI ƯU 2: Tái cấu trúc vòng lặp để không tạo DataFrame mới liên tục ---
-        for pair_y, pair_x in itertools.permutations(self.whitelist, 2):
+        from tqdm import tqdm
+
+        for pair_y, pair_x in tqdm(list(itertools.permutations(self.whitelist, 2))):
             try:
                 # Chọn 2 cột cần thiết từ DataFrame đã gộp, không cần tạo df_merged mới
                 df_pair = all_closes_df[[pair_y, pair_x]].copy()
@@ -123,7 +124,6 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         return dataframe
 
     def fn_ecm(self, df: pd.DataFrame, y_col: str, x_col: str):
-        # Dữ liệu đầu vào đã là float32 nên các tính toán sẽ nhanh hơn
         y = df[y_col]
         x = df[x_col]
 
@@ -180,9 +180,9 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
         ).sum()
         z_cross_zero_count = crossing_1 + crossing_minus1
 
-        if half_life < 1440 and half_life > 0:
-            logger.info(f"Half-life for {y_col} vs {x_col}: {half_life}")
-            logger.info(f"corr {y_col} vs {x_col}: {corr}")
+        # if half_life < 1440 and half_life > 0:
+        #     logger.info(f"Half-life for {y_col} vs {x_col}: {half_life}")
+        #     logger.info(f"corr {y_col} vs {x_col}: {corr}")
 
         return (
             c,
@@ -203,7 +203,6 @@ class pair_trading_get_para_V1_J_price_0723(IStrategy):
             return [self.convert_numpy_types(v) for v in obj]
         elif isinstance(obj, (np.integer, np.int32, np.int64)):
             return int(obj)
-        # Chuyển đổi cả float32 và float64
         elif isinstance(obj, (np.floating, np.float32, np.float64)):
             return float(obj)
         elif pd.isna(obj):
