@@ -1,0 +1,33 @@
+{
+  "add_config_files": ["./base.json"],
+  "max_open_trades": 3,
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "exchange": {
+    "pair_whitelist": [
+      // "BTC/USDT:USDT",
+      "ETH/USDT:USDT",
+      // "XRP/USDT:USDT",
+      // "BNB/USDT:USDT"
+      // "SOL/USDT:USDT",
+      // "DOGE/USDT:USDT",
+      // "TRX/USDT:USDT"
+      "ADA/USDT:USDT",
+      // "LINK/USDT:USDT"
+      "AVAX/USDT:USDT"
+      // "SUI/USDT:USDT"
+      // "XLM/USDT",
+      // "BCH/USDT:USDT"
+      // "HBAR/USDT",
+      // "LTC/USDT:USDT"
+      // "TON/USDT",
+      // "SHIB/USDT",
+      // "DOT/USDT:USDT"
+    ]
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ]
+}
