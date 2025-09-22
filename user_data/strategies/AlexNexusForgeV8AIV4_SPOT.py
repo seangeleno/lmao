@@ -70,6 +70,7 @@ try:
         recall_score,
         f1_score,
         roc_auc_score,
+        average_precision_score,
     )
     from sklearn.model_selection import cross_val_score, GridSearchCV
     from sklearn.feature_selection import SelectKBest, f_classif
@@ -2320,7 +2321,7 @@ class AdvancedPredictiveEngine:
 
                 # Calculate AUC metrics using probabilities when available
                 try:
-                    from sklearn.metrics import roc_auc_score, average_precision_score
+                    # from sklearn.metrics import roc_auc_score, average_precision_score
 
                     if hasattr(model, "predict_proba") and len(np.unique(y_test)) > 1:
                         auc_roc = roc_auc_score(y_test, y_pred_proba)
