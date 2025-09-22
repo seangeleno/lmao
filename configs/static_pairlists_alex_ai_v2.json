@@ -1,0 +1,20 @@
+{
+  "add_config_files": ["./base.json"],
+  "max_open_trades": 1,
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "exchange": {
+    "pair_whitelist": [
+      "ETH/USDT:USDT",
+      "SOL/USDT:USDT",
+      "BNB/USDT:USDT",
+      "XRP/USDT:USDT",
+      "LINK/USDT:USDT"
+    ]
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ]
+}

@@ -1252,6 +1252,8 @@ def pmax(df, period, multiplier, length, MAtype, src):
 
     pm = Series(pm_arr)
 
-    pmx = np.where((pm_arr > 0.00), np.where((mavalue < pm_arr), "down", "up"), "neutral")
+    pmx = np.where(
+        (pm_arr > 0.00), np.where((mavalue < pm_arr), "down", "up"), "neutral"
+    )
 
     return pm, pmx
