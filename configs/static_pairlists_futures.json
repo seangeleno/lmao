@@ -14,7 +14,11 @@
       "AVAX/USDT:USDT",
       "SUI/USDT:USDT",
       "LINK:USDT:USDT",
-      "LTC/USDT:USDT"
+      "LTC/USDT:USDT",
+      "TRX/USDT:USDT",
+      "BCH/USDT:USDT",
+      "XLM/USDT:USDT",
+      "ADA/USDT:USDT"
     ]
   },
   "pairlists": [
