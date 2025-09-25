@@ -1,6 +1,6 @@
 {
   "add_config_files": ["./base.json"],
-  "max_open_trades": 10,
+  "max_open_trades": 2,
   "exchange": {
     "pair_whitelist": [
       "BTC/USDT",
