@@ -11,6 +11,7 @@ import talib.abstract as ta
 from freqtrade.persistence import Trade
 from freqtrade.exchange import timeframe_to_prev_date
 import logging
+from NewsSentimentEngine import NewsSentimentEngine
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ class TradingStyleManager:
         self.style_switch_cooldown = 0
         self.min_switch_interval = 0.5  # minimum 30 minutes between switches (improves responsiveness)
         
-        # === Stable Modeconfiguration ===
+        # === Stable Mode Configuration ===
         self.STABLE_CONFIG = {
             'name': 'Stable Mode',
             'leverage_range': (2, 5),  # raise base leverage from 1-3 to 2-5
@@ -36,7 +37,7 @@ class TradingStyleManager:
             'description': 'balanced and steady, combining stable returns with moderate risk'
         }
         
-        # === Sideways Modeconfiguration ===  
+        # === Sideways Mode Configuration ===
         self.SIDEWAYS_CONFIG = {
             'name': 'Sideways Mode',
             'leverage_range': (4, 8),  # raise leverage from 2-5 to 4-8
@@ -48,7 +49,7 @@ class TradingStyleManager:
             'description': 'active range trading with quick entries and exits, medium-high risk and reward'
         }
         
-        # === Aggressive Modeconfiguration ===
+        # === Aggressive Mode Configuration ===
         self.AGGRESSIVE_CONFIG = {
             'name': 'Aggressive Mode',
             'leverage_range': (5, 10),  # optimize leverage from 3-10 to 5-10 for better capital usage
@@ -359,6 +360,8 @@ class UltraSmartStrategy(IStrategy):
     correlation_threshold = 0.7    # correlation threshold
     rebalance_threshold = 0.1      # rebalance threshold
     portfolio_optimization_method = 'kelly'  # 'kelly', 'markowitz', 'risk_parity'
+    news_sentiment_enabled = True
+    news_prefetch_interval_seconds = 300
     
     def bot_start(self, **kwargs) -> None:
         """Strategy initialization"""
@@ -418,6 +421,243 @@ class UltraSmartStrategy(IStrategy):
         # initialize style-switch tracking
         self.last_style_check = datetime.now(timezone.utc)
         self.style_check_interval = 300  # check for style switches every 5 minutes
+        self.last_news_prefetch = None
+        self._news_signal_cache = {}
+        self._init_news_sentiment_engine()
+
+    def _init_news_sentiment_engine(self) -> None:
+        news_config = self.config.get('news_sentiment', {}) if hasattr(self, 'config') else {}
+        self.news_sentiment_enabled = bool(
+            news_config.get('enabled', self.news_sentiment_enabled)
+        )
+        if not self.news_sentiment_enabled:
+            self.news_sentiment_engine = None
+            logger.info("News sentiment integration disabled.")
+            return
+
+        api_key = str(news_config.get('api_key') or "").strip()
+        backend = str(news_config.get('backend', 'hybrid')).strip()
+        source_weights = news_config.get('source_weights')
+        trusted_positive_sources = news_config.get('trusted_positive_sources')
+        self.news_prefetch_interval_seconds = max(
+            60,
+            int(
+                news_config.get(
+                    'prefetch_interval_seconds',
+                    self.news_prefetch_interval_seconds,
+                )
+            ),
+        )
+
+        self.news_sentiment_engine = NewsSentimentEngine(
+            api_key=api_key,
+            logger=logger,
+            backend=backend,
+            roberta_model=str(
+                news_config.get(
+                    'roberta_model',
+                    "cardiffnlp/twitter-roberta-base-sentiment-latest",
+                )
+            ),
+            lookback_hours=int(news_config.get('lookback_hours', 2)),
+            cache_minutes=int(news_config.get('cache_minutes', 15)),
+            page_size=int(news_config.get('page_size', 10)),
+            min_articles_to_block=int(news_config.get('min_articles_to_block', 2)),
+            min_articles_to_reduce=int(news_config.get('min_articles_to_reduce', 1)),
+            block_abs_sentiment=float(news_config.get('block_abs_sentiment', 0.30)),
+            reduce_abs_sentiment=float(news_config.get('reduce_abs_sentiment', 0.18)),
+            min_impact_to_block=float(news_config.get('min_impact_to_block', 0.25)),
+            min_stake_multiplier=float(news_config.get('min_stake_multiplier', 0.40)),
+            max_stake_multiplier=float(news_config.get('max_stake_multiplier', 1.10)),
+            stake_reduction_scale=float(news_config.get('stake_reduction_scale', 0.50)),
+            positive_boost_threshold=float(news_config.get('positive_boost_threshold', 0.45)),
+            min_confidence_to_act=float(news_config.get('min_confidence_to_act', 0.35)),
+            max_fallback_minutes=int(news_config.get('max_fallback_minutes', 60)),
+            request_timeout=int(news_config.get('request_timeout', 10)),
+            language=str(news_config.get('language', 'en')),
+            source_weights=source_weights if isinstance(source_weights, dict) else None,
+            trusted_positive_sources=(
+                trusted_positive_sources
+                if isinstance(trusted_positive_sources, list)
+                else None
+            ),
+        )
+
+        status = self.news_sentiment_engine.backend_status()
+        logger.info(
+            "News sentiment engine initialized: enabled=%s backend=%s ready=%s",
+            self.news_sentiment_enabled,
+            status['backend'],
+            status['ready'],
+        )
+
+    def _extract_base_asset(self, pair: str) -> str:
+        base = str(pair or "").split("/")[0]
+        return base.split(":")[0].upper()
+
+    def _default_news_asset_names(self) -> dict[str, list[str]]:
+        return {
+            'BTC': ['Bitcoin'],
+            'ETH': ['Ethereum', 'Ether'],
+            'BNB': ['BNB', 'Binance Coin'],
+            'SOL': ['Solana'],
+            'XRP': ['XRP', 'Ripple'],
+            'ADA': ['Cardano'],
+            'DOGE': ['Dogecoin'],
+            'AVAX': ['Avalanche'],
+            'DOT': ['Polkadot'],
+            'LINK': ['Chainlink'],
+            'MATIC': ['Polygon', 'POL'],
+            'POL': ['Polygon', 'POL'],
+            'ATOM': ['Cosmos'],
+            'NEAR': ['Near Protocol'],
+            'ONE': ['Harmony'],
+            'UNI': ['Uniswap'],
+            'AAVE': ['Aave'],
+            'SUI': ['Sui'],
+            'APT': ['Aptos'],
+            'ARB': ['Arbitrum'],
+            'OP': ['Optimism'],
+            'INJ': ['Injective'],
+            'TIA': ['Celestia'],
+            'SEI': ['Sei'],
+            'TAO': ['Bittensor'],
+            'PEPE': ['Pepe'],
+            'SHIB': ['Shiba Inu'],
+            'WIF': ['dogwifhat'],
+            'BONK': ['Bonk'],
+            'FET': ['Fetch.ai', 'Artificial Superintelligence Alliance', 'ASI'],
+            'RENDER': ['Render'],
+            'RNDR': ['Render'],
+            'TRX': ['Tron'],
+            'ETC': ['Ethereum Classic'],
+            'BCH': ['Bitcoin Cash'],
+            'LTC': ['Litecoin'],
+            'XLM': ['Stellar'],
+            'HBAR': ['Hedera'],
+            'FIL': ['Filecoin'],
+        }
+
+    def _dedupe_news_aliases(self, aliases: list[str]) -> list[str]:
+        deduped = []
+        seen = set()
+        for alias in aliases:
+            cleaned = str(alias).strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(cleaned)
+        return deduped
+
+    def _expand_news_aliases(self, base_asset: str, aliases: list[str]) -> list[str]:
+        expanded = list(aliases)
+        ambiguity_sensitive = {
+            'ONE', 'NEAR', 'LINK', 'ATOM', 'OP', 'TIA', 'TAO', 'SEI', 'SUI', 'APT',
+            'INJ', 'ARB', 'UNI', 'FIL', 'ETC', 'BCH', 'TRX', 'XLM', 'HBAR', 'FET',
+        }
+
+        for alias in list(aliases):
+            alias_clean = str(alias).strip()
+            if not alias_clean:
+                continue
+            expanded.append(f"{alias_clean} crypto")
+            expanded.append(f"{alias_clean} token")
+            if len(alias_clean) > 3:
+                expanded.append(f"{alias_clean} blockchain")
+
+        if base_asset:
+            expanded.append(base_asset)
+            expanded.append(f"{base_asset} crypto")
+            expanded.append(f"{base_asset} token")
+            if base_asset in ambiguity_sensitive:
+                expanded.append(f"{base_asset} cryptocurrency")
+
+        return self._dedupe_news_aliases(expanded)
+
+    def _get_news_aliases(self, pair: str) -> list[str]:
+        news_config = self.config.get('news_sentiment', {}) if hasattr(self, 'config') else {}
+        alias_map = news_config.get('aliases', {})
+        asset_name_map = news_config.get('asset_names', {})
+        if not isinstance(alias_map, dict):
+            alias_map = {}
+        if not isinstance(asset_name_map, dict):
+            asset_name_map = {}
+
+        base_asset = self._extract_base_asset(pair)
+        aliases = []
+        for key in (pair, base_asset):
+            value = alias_map.get(key)
+            if isinstance(value, list):
+                aliases.extend(str(alias).strip() for alias in value if str(alias).strip())
+
+        configured_asset_names = asset_name_map.get(base_asset)
+        if isinstance(configured_asset_names, list):
+            aliases.extend(str(alias).strip() for alias in configured_asset_names if str(alias).strip())
+        elif isinstance(configured_asset_names, str) and configured_asset_names.strip():
+            aliases.append(configured_asset_names.strip())
+
+        aliases.extend(self._default_news_asset_names().get(base_asset, []))
+
+        auto_expand = bool(news_config.get('auto_expand_aliases', True))
+        aliases = self._dedupe_news_aliases(aliases)
+        if auto_expand:
+            aliases = self._expand_news_aliases(base_asset, aliases)
+        elif base_asset and base_asset not in aliases:
+            aliases.append(base_asset)
+
+        return aliases
+
+    def _get_news_signal(self, pair: str, current_time: datetime):
+        if not getattr(self, 'news_sentiment_engine', None):
+            return None
+
+        base_asset = self._extract_base_asset(pair)
+        aliases = self._get_news_aliases(pair)
+        signal = self.news_sentiment_engine.get_signal(
+            asset=base_asset,
+            current_time=current_time,
+            aliases=aliases,
+        )
+        self._news_signal_cache[base_asset] = signal
+        return signal
+
+    def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
+        if not getattr(self, 'news_sentiment_engine', None):
+            return
+
+        current_time = (
+            current_time.astimezone(timezone.utc)
+            if current_time.tzinfo
+            else current_time.replace(tzinfo=timezone.utc)
+        )
+        if (
+            self.last_news_prefetch
+            and (current_time - self.last_news_prefetch).total_seconds()
+            < self.news_prefetch_interval_seconds
+        ):
+            return
+
+        pairs = []
+        try:
+            if hasattr(self, 'dp') and self.dp:
+                pairs = list(self.dp.current_whitelist())
+        except Exception:
+            pairs = []
+
+        if not pairs:
+            exchange_config = self.config.get('exchange', {}) if hasattr(self, 'config') else {}
+            pairs = list(exchange_config.get('pair_whitelist', []))
+
+        for pair in pairs:
+            try:
+                self._get_news_signal(pair, current_time)
+            except Exception as exc:
+                logger.warning("News prefetch failed for %s: %s", pair, exc)
+
+        self.last_news_prefetch = current_time
         
     def initialize_performance_optimization(self):
         """Initialize the performance optimization system"""
@@ -534,7 +774,7 @@ class UltraSmartStrategy(IStrategy):
     # Removed dynamic_stoploss - simplified stoploss logic
     
     def check_and_switch_trading_style(self, dataframe: DataFrame) -> None:
-        """check andSwitch trading style"""
+        """Check whether the trading style should switch."""
         
         current_time = datetime.now(timezone.utc)
         
@@ -560,35 +800,35 @@ class UltraSmartStrategy(IStrategy):
                 # record style-switch log
                 self._log_style_switch(old_config, new_config, reason, dataframe)
     
-    def _log_style_switch(self, old_config: dict, new_config: dict, 
+    def _log_style_switch(self, old_config: dict, new_config: dict,
                          reason: str, dataframe: DataFrame) -> None:
-        """record style-switch details"""
+        """Record detailed information about a trading-style switch."""
         
         try:
             current_data = dataframe.iloc[-1] if not dataframe.empty else {}
             
             switch_log = f"""
-==================== Trading style switch ====================
-time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-translatedReason: {reason}
+==================== Trading Style Switch ====================
+Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+Reason: {reason}
 
-📊 market state analysis:
-├─ trend strength: {current_data.get('trend_strength', 0):.0f}/100
-├─ ADXvalue: {current_data.get('adx', 0):.1f}  
-├─ volatility state: {current_data.get('volatility_state', 0):.0f}/100
-├─ ATRvolatility: {(current_data.get('atr_p', 0) * 100):.2f}%
+📊 Market regime analysis:
+├─ Trend strength: {current_data.get('trend_strength', 0):.0f}/100
+├─ ADX value: {current_data.get('adx', 0):.1f}
+├─ Volatility state: {current_data.get('volatility_state', 0):.0f}/100
+├─ ATR volatility: {(current_data.get('atr_p', 0) * 100):.2f}%
 
-🔄 style change details:
-├─ old style: {old_config['name']} → new style: {new_config['name']}
-├─ leverage adjustment: {old_config['leverage_range']} → {new_config['leverage_range']}
-├─ position adjustment: {[f"{p*100:.0f}%" for p in old_config['position_range']]} → {[f"{p*100:.0f}%" for p in new_config['position_range']]}
-├─ risk adjustment: {old_config['risk_per_trade']*100:.1f}% → {new_config['risk_per_trade']*100:.1f}%
+🔄 Style change details:
+├─ Old style: {old_config['name']} → New style: {new_config['name']}
+├─ Leverage adjustment: {old_config['leverage_range']} → {new_config['leverage_range']}
+├─ Position adjustment: {[f"{p*100:.0f}%" for p in old_config['position_range']]} → {[f"{p*100:.0f}%" for p in new_config['position_range']]}
+├─ Risk adjustment: {old_config['risk_per_trade']*100:.1f}% → {new_config['risk_per_trade']*100:.1f}%
 
-🎯 new style features:
-├─ description: {new_config['description']}
-├─ entry threshold: {new_config['entry_threshold']:.1f}
-├─ max concurrent: {new_config['max_trades']}count
-├─ cooldown period: {self.style_manager.style_switch_cooldown}hours
+🎯 New style settings:
+├─ Description: {new_config['description']}
+├─ Entry threshold: {new_config['entry_threshold']:.1f}
+├─ Max concurrent trades: {new_config['max_trades']}
+├─ Cooldown period: {self.style_manager.style_switch_cooldown} hours
 
 =================================================="""
             
@@ -608,9 +848,9 @@ translatedReason: {reason}
     # Removed informative_pairs() method - no longer needed without informative timeframes
     
     def get_market_orderbook(self, pair: str) -> Dict:
-        """get orderbook data"""
+        """Get orderbook data and derive market microstructure metrics."""
         try:
-            orderbook = self.dp.orderbook(pair, 10)  # get10translated
+            orderbook = self.dp.orderbook(pair, 10)  # fetch top 10 bid/ask levels
             if orderbook:
                 bids = np.array([[float(bid[0]), float(bid[1])] for bid in orderbook['bids']])
                 asks = np.array([[float(ask[0]), float(ask[1])] for ask in orderbook['asks']])
@@ -627,11 +867,11 @@ translatedReason: {reason}
                 # calculate depth imbalance
                 imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume + 1e-10)
                 
-                # calculate buy/sell pressure metrics (0-1range)
+                # calculate buy/sell pressure metrics (0-1 range)
                 buy_pressure = bid_volume / (bid_volume + ask_volume + 1e-10)
                 sell_pressure = ask_volume / (bid_volume + ask_volume + 1e-10)
                 
-                # calculate market quality (0-1range)
+                # calculate market quality (0-1 range)
                 total_volume = bid_volume + ask_volume
                 spread_quality = max(0, 1 - spread / 1.0)  # smaller spread means higher quality
                 volume_quality = min(1, total_volume / 10000)  # higher volume means higher quality
@@ -665,21 +905,21 @@ translatedReason: {reason}
         }
     
     def calculate_technical_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """optimized technical-indicator calculation - avoidDataFrametranslated"""
+        """Calculate the core technical indicator set with batched dataframe writes."""
         
         # use a dictionary to batch-store all new columns
         new_columns = {}
         
-        # === optimized sensitive moving-average system - translated，fast ===
-        new_columns['ema_5'] = ta.EMA(dataframe, timeperiod=5)    # ultra-short-term：quickly capture changes
+        # === Optimized responsive moving-average system ===
+        new_columns['ema_5'] = ta.EMA(dataframe, timeperiod=5)    # ultra-short-term: capture rapid changes
         new_columns['ema_8'] = ta.EMA(dataframe, timeperiod=8)    # ultra-short-term enhancement
-        new_columns['ema_13'] = ta.EMA(dataframe, timeperiod=13)  # short-term：trend confirmation
+        new_columns['ema_13'] = ta.EMA(dataframe, timeperiod=13)  # short-term: trend confirmation
         new_columns['ema_21'] = ta.EMA(dataframe, timeperiod=21)  # medium-short-term transition
-        new_columns['ema_34'] = ta.EMA(dataframe, timeperiod=34)  # mid stage：main-trend filter
+        new_columns['ema_34'] = ta.EMA(dataframe, timeperiod=34)  # medium-term main trend filter
         new_columns['ema_50'] = ta.EMA(dataframe, timeperiod=50)  # long-term trend
-        new_columns['sma_20'] = ta.SMA(dataframe, timeperiod=20)  # translatedSMA20as
+        new_columns['sma_20'] = ta.SMA(dataframe, timeperiod=20)  # baseline SMA reference
         
-        # === Bollinger Bands (translated，high indicator) ===
+        # === Bollinger Bands ===
         bb = qtpylib.bollinger_bands(dataframe['close'], window=self.bb_period, stds=self.bb_std)
         new_columns['bb_lower'] = bb['lower']
         new_columns['bb_middle'] = bb['mid']
@@ -689,21 +929,21 @@ translatedReason: {reason}
                                         0)
         new_columns['bb_position'] = (dataframe['close'] - bb['lower']) / (bb['upper'] - bb['lower'])
         
-        # === RSI (most has14translated) ===
+        # === RSI (standard 14-period) ===
         new_columns['rsi_14'] = ta.RSI(dataframe, timeperiod=14)
         
-        # === MACD (translated，classic trend indicator) ===
+        # === MACD (classic trend indicator) ===
         macd = ta.MACD(dataframe, fastperiod=self.macd_fast, slowperiod=self.macd_slow, signalperiod=self.macd_signal)
         new_columns['macd'] = macd['macd']
         new_columns['macd_signal'] = macd['macdsignal'] 
         new_columns['macd_hist'] = macd['macdhist']
         
-        # === ADX trend strength (translated，important trend indicator) ===
+        # === ADX trend strength ===
         new_columns['adx'] = ta.ADX(dataframe, timeperiod=self.adx_period)
         new_columns['plus_di'] = ta.PLUS_DI(dataframe, timeperiod=self.adx_period)
         new_columns['minus_di'] = ta.MINUS_DI(dataframe, timeperiod=self.adx_period)
         
-        # === ATR volatility (translated，required for risk management) ===
+        # === ATR volatility (used in risk management) ===
         new_columns['atr'] = ta.ATR(dataframe, timeperiod=self.atr_period)
         new_columns['atr_p'] = new_columns['atr'] / dataframe['close']
         
@@ -719,7 +959,7 @@ translatedReason: {reason}
         
         # === new leading-indicator set - solve lagging issues ===
         
-        # 1. fastRSI - translatedRSItranslated
+        # 1. Fast RSI variant for earlier turning-point signals
         stoch_rsi = ta.STOCHRSI(dataframe, timeperiod=14, fastk_period=3, fastd_period=3)
         new_columns['stoch_rsi_k'] = stoch_rsi['fastk']
         new_columns['stoch_rsi_d'] = stoch_rsi['fastd']
@@ -727,10 +967,10 @@ translatedReason: {reason}
         # 2. Williams indicator - fast reversal signal
         new_columns['williams_r'] = ta.WILLR(dataframe, timeperiod=14)
         
-        # 3. CCItranslated - sensitive overbought/oversold indicator  
+        # 3. CCI - responsive overbought/oversold indicator
         new_columns['cci'] = ta.CCI(dataframe, timeperiod=20)
         
-        # 4. price action analysis - translatedKtranslated
+        # 4. Price action analysis
         new_columns['candle_body'] = abs(dataframe['close'] - dataframe['open'])
         new_columns['candle_upper_shadow'] = dataframe['high'] - np.maximum(dataframe['close'], dataframe['open'])
         new_columns['candle_lower_shadow'] = np.minimum(dataframe['close'], dataframe['open']) - dataframe['low']
@@ -743,11 +983,11 @@ translatedReason: {reason}
         # 8. support/resistance breakout strength
         new_columns['resistance_strength'] = (
             dataframe['close'] / dataframe['high'].rolling(20).max() - 1
-        ) * 100  # translated20day most high
+        ) * 100  # distance from the 20-period high
         
         new_columns['support_strength'] = (
             1 - dataframe['close'] / dataframe['low'].rolling(20).min()
-        ) * 100  # translated20day most low
+        ) * 100  # distance from the 20-period low
         
         # === VWAP (important institutional trading reference) ===
         new_columns['vwap'] = qtpylib.rolling_vwap(dataframe)
@@ -755,7 +995,7 @@ translatedReason: {reason}
         # === supertrend (efficient trend following) ===
         new_columns['supertrend'] = self.supertrend(dataframe, 10, 3)
         
-        # 1 times will has new todataframe，useconcatavoid
+        # Add new columns in one batch to avoid repeated dataframe mutations
         if new_columns:
             new_df = pd.DataFrame(new_columns, index=dataframe.index)
             dataframe = pd.concat([dataframe, new_df], axis=1)
@@ -788,7 +1028,7 @@ translatedReason: {reason}
         
         if missing_indicators:
             logger.error(f"critical indicator calculation failed: {missing_indicators}")
-            # as indicator default value，use update avoid
+            # Fill critical indicators with safe defaults when calculation fails
             default_values = {}
             for indicator in missing_indicators:
                 if indicator == 'rsi_14':
@@ -806,7 +1046,7 @@ translatedReason: {reason}
                 elif indicator == 'momentum_score':
                     default_values[indicator] = 0.0
                 elif indicator in ['ema_5', 'ema_13', 'ema_34']:
-                    # translatedEMAindicator，recalculate
+                    # Recalculate missing EMA indicators directly
                     if indicator == 'ema_5':
                         default_values[indicator] = ta.EMA(dataframe, timeperiod=5)
                     elif indicator == 'ema_13':
@@ -821,13 +1061,13 @@ translatedReason: {reason}
         else:
             logger.info("✅ all indicators calculated successfully")
         
-        # === translatedEMAindicator ===
-        # checkEMAindicator hasNaNvalue
+        # === EMA integrity check ===
+        # Rebuild EMA columns if they contain too many missing values
         for ema_col in ['ema_8', 'ema_21', 'ema_50']:
             if ema_col in dataframe.columns:
                 nan_count = dataframe[ema_col].isnull().sum()
                 total_count = len(dataframe)
-                if nan_count > total_count * 0.1:  # translated10%value asNaN
+                if nan_count > total_count * 0.1:  # more than 10% missing values
                     logger.warning(f"{ema_col} has too many missing values ({nan_count}/{total_count}), recalculate")
                     if ema_col == 'ema_8':
                         dataframe[ema_col] = ta.EMA(dataframe, timeperiod=8)
@@ -839,41 +1079,41 @@ translatedReason: {reason}
         return dataframe
     
     def calculate_optimized_composite_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """optimized composite indicators - avoidDataFrametranslated"""
+        """Calculate composite indicators while minimizing dataframe churn."""
         
         # use a dictionary to batch-store all new columns
         new_columns = {}
         
-        # === revolutionary trend-strength scoring system - momentum，before2-3translatedKtranslated ===
+        # === Composite trend-strength scoring system ===
         
-        # 1. price-momentum slope analysis（early warning） - useEMA(5,13,34)
+        # 1. Price-momentum slope analysis (early warning) using EMA(5, 13, 34)
         ema5_slope = np.where(dataframe['ema_5'].shift(2) > 0,
                              (dataframe['ema_5'] - dataframe['ema_5'].shift(2)) / dataframe['ema_5'].shift(2),
-                             0) * 100  # short，fast
+                             0) * 100  # short-term, fast response
         ema13_slope = np.where(dataframe['ema_13'].shift(3) > 0,
                               (dataframe['ema_13'] - dataframe['ema_13'].shift(3)) / dataframe['ema_13'].shift(3),
                               0) * 100
         
-        # 2. moving-average divergence analysis（trend-acceleration signal）
+        # 2. Moving-average divergence analysis (trend acceleration signal)
         ema_spread = np.where(dataframe['ema_34'] > 0,
                              (dataframe['ema_5'] - dataframe['ema_34']) / dataframe['ema_34'] * 100,
                              0)
         ema_spread_series = self._safe_series(ema_spread, len(dataframe))
         ema_spread_change = ema_spread - ema_spread_series.shift(3)  # divergence change
         
-        # 3. ADXtranslated（trend-strengthening signal）
-        adx_slope = dataframe['adx'] - dataframe['adx'].shift(3)  # ADXtranslated
-        adx_acceleration = adx_slope - adx_slope.shift(2)  # ADXtranslated
+        # 3. ADX slope and acceleration (trend strengthening signal)
+        adx_slope = dataframe['adx'] - dataframe['adx'].shift(3)  # ADX slope
+        adx_acceleration = adx_slope - adx_slope.shift(2)  # ADX acceleration
         
         # 4. volume trend confirmation
         volume_20_mean = dataframe['volume'].rolling(20).mean()
         volume_trend = np.where(volume_20_mean != 0,
                                dataframe['volume'].rolling(5).mean() / volume_20_mean,
-                               1.0)  # translated20day as0，translated1.0（mid）
+                               1.0)  # default to neutral if the 20-period mean is zero
         volume_trend_series = self._safe_series(volume_trend, len(dataframe))
         volume_momentum = volume_trend_series - volume_trend_series.shift(2).fillna(0)
         
-        # 5. price acceleration（second derivative）
+        # 5. Price acceleration (second derivative)
         close_shift_3 = dataframe['close'].shift(3)
         price_velocity = np.where(close_shift_3 != 0,
                                  (dataframe['close'] / close_shift_3 - 1) * 100,
@@ -881,9 +1121,9 @@ translatedReason: {reason}
         price_velocity_series = self._safe_series(price_velocity, len(dataframe))
         price_acceleration = price_velocity_series - price_velocity_series.shift(2).fillna(0)
         
-        # === composite trend-strength score ===
+        # === Composite trend-strength score ===
         trend_score = (
-            ema5_slope * 0.30 +        # ultra-short-term momentum（most，high weight）
+            ema5_slope * 0.30 +        # ultra-short-term momentum with the highest weight
             ema13_slope * 0.20 +       # short-term momentum confirmation
             ema_spread_change * 0.15 + # trend-divergence change
             adx_slope * 0.15 +         # trend-strength change
@@ -891,7 +1131,7 @@ translatedReason: {reason}
             price_acceleration * 0.10  # price acceleration
         )
         
-        # useADXas trend confirmation
+        # Use ADX as a trend-confirmation multiplier
         adx_multiplier = np.where(dataframe['adx'] > 30, 1.5,
                                  np.where(dataframe['adx'] > 20, 1.2,
                                          np.where(dataframe['adx'] > 15, 1.0, 0.7)))
@@ -900,24 +1140,24 @@ translatedReason: {reason}
         new_columns['trend_strength'] = (trend_score * adx_multiplier).clip(-100, 100)
         new_columns['price_acceleration'] = price_acceleration
         
-        # === momentum composite indicators ===
+        # === Momentum composite indicators ===
         rsi_normalized = (dataframe['rsi_14'] - 50) / 50  # -1 to 1
         macd_normalized = np.where(dataframe['atr_p'] > 0, 
                                  dataframe['macd_hist'] / (dataframe['atr_p'] * dataframe['close']), 
-                                 0)  # normalize
-        price_momentum = (dataframe['close'] / dataframe['close'].shift(5) - 1) * 10  # 5period price change
+                                 0)  # volatility-normalized MACD histogram
+        price_momentum = (dataframe['close'] / dataframe['close'].shift(5) - 1) * 10  # 5-period price change
         
         new_columns['momentum_score'] = (rsi_normalized + macd_normalized + price_momentum) / 3
         new_columns['price_velocity'] = price_velocity_series
         
-        # === volatility-state indicator ===  
+        # === Volatility-state indicator ===
         atr_percentile = dataframe['atr_p'].rolling(50).rank(pct=True)
         bb_squeeze = np.where(dataframe['bb_width'] < dataframe['bb_width'].rolling(20).quantile(0.3), 1, 0)
         volume_spike = np.where(dataframe['volume_ratio'] > 1.5, 1, 0)
         
         new_columns['volatility_state'] = atr_percentile * 50 + bb_squeeze * 25 + volume_spike * 25
         
-        # === support/resistance strength ===
+        # === Support/resistance strength ===
         bb_position_score = np.abs(dataframe['bb_position'] - 0.5) * 2  # 0-1, the closer to the edge, the higher the score
         vwap_distance = np.where(dataframe['vwap'] > 0, 
                                 np.abs((dataframe['close'] - dataframe['vwap']) / dataframe['vwap']) * 100, 
@@ -925,28 +1165,28 @@ translatedReason: {reason}
         
         new_columns['sr_strength'] = (bb_position_score + np.minimum(vwap_distance, 5)) / 2  # normalize to a reasonable range
         
-        # === trend sustainability indicator ===
+        # === Trend sustainability indicator ===
         adx_sustainability = np.where(dataframe['adx'] > 25, 1, 0)
         volume_sustainability = np.where(dataframe['volume_ratio'] > 0.8, 1, 0)
         volatility_sustainability = np.where(dataframe['atr_p'] < dataframe['atr_p'].rolling(20).quantile(0.8), 1, 0)
         new_columns['trend_sustainability'] = (
             (adx_sustainability * 0.5 + volume_sustainability * 0.3 + volatility_sustainability * 0.2) * 2 - 1
-        ).clip(-1, 1)  # normalize to[-1, 1]
+        ).clip(-1, 1)  # normalize to [-1, 1]
         
-        # === RSIdivergence strength indicator ===
+        # === RSI divergence strength indicator ===
         price_high_10 = dataframe['high'].rolling(10).max()
         price_low_10 = dataframe['low'].rolling(10).min()
         rsi_high_10 = dataframe['rsi_14'].rolling(10).max()
         rsi_low_10 = dataframe['rsi_14'].rolling(10).min()
         
-        # bearish divergence：price new high butRSInew high
+        # Bearish divergence: price makes a new high while RSI does not
         bearish_divergence = np.where(
             (dataframe['high'] >= price_high_10) & (dataframe['rsi_14'] < rsi_high_10),
             -(dataframe['high'] / price_high_10 - dataframe['rsi_14'] / rsi_high_10),
             0
         )
         
-        # bullish divergence：price new low butRSInew low
+        # Bullish divergence: price makes a new low while RSI does not
         bullish_divergence = np.where(
             (dataframe['low'] <= price_low_10) & (dataframe['rsi_14'] > rsi_low_10),
             (dataframe['low'] / price_low_10 - dataframe['rsi_14'] / rsi_low_10),
@@ -955,9 +1195,9 @@ translatedReason: {reason}
         
         new_columns['rsi_divergence_strength'] = (bearish_divergence + bullish_divergence).clip(-2, 2)
         
-        # === new：predictive indicator system ===
+        # === Predictive indicator system ===
         
-        # 1. translatedRSIdivergence
+        # 1. Simple RSI divergence flags
         price_higher_5 = dataframe['close'] > dataframe['close'].shift(5)
         rsi_lower_5 = dataframe['rsi_14'] < dataframe['rsi_14'].shift(5)
         new_columns['bearish_divergence'] = (price_higher_5 & rsi_lower_5).astype(int)
@@ -974,7 +1214,7 @@ translatedReason: {reason}
         )
         new_columns['volume_exhaustion'] = volume_decreasing.astype(int)
         
-        # 3. price-acceleration change（predict turning points）
+        # 3. Price-acceleration change (used to predict turning points)
         price_roc_3 = dataframe['close'].pct_change(3)
         price_acceleration_new = price_roc_3 - price_roc_3.shift(3)
         new_columns['price_acceleration_rate'] = price_acceleration_new
@@ -989,20 +1229,20 @@ translatedReason: {reason}
         )
         new_columns['momentum_exhaustion_score'] = momentum_exhaustion
         
-        # 5. trend phase detection（predictive）
-        # early stage：breakout+translated
+        # 5. Trend phase detection
+        # early stage: breakout with strengthening participation
         trend_early = (
             (dataframe['adx'] > dataframe['adx'].shift(1)) &
             (dataframe['adx'] > 20) &
             (dataframe['volume_ratio'] > 1.2)
         ).astype(int)
-        # mid stage：stable trend
+        # mid stage: stable trend
         trend_middle = (
             (dataframe['adx'] > 25) &
             (np.abs(price_acceleration_new) < 0.02) &
             (~volume_decreasing)
         ).astype(int)
-        # late stage：translated+divergence
+        # late stage: exhaustion and divergence
         trend_late = (
             (np.abs(price_acceleration_new) > 0.03) |
             (new_columns['bearish_divergence'] == 1) |
@@ -1013,21 +1253,21 @@ translatedReason: {reason}
         new_columns['trend_phase'] = trend_late * 3 + trend_middle * 2 + trend_early * 1
         
         # === market sentiment indicator ===
-        rsi_sentiment = (dataframe['rsi_14'] - 50) / 50  # normalizeRSI
+        rsi_sentiment = (dataframe['rsi_14'] - 50) / 50  # normalized RSI
         volatility_sentiment = np.where(dataframe['atr_p'] > 0, 
                                        -(dataframe['atr_p'] / dataframe['atr_p'].rolling(20).mean() - 1), 
-                                       0)  # high volatility=translated，low volatility=translated
-        volume_sentiment = np.where(dataframe['volume_ratio'] > 1.5, -0.5,  # abnormal volume spike=translated
-                                   np.where(dataframe['volume_ratio'] < 0.7, 0.5, 0))  # translated=translated
+                                       0)  # high volatility is risk-off, low volatility is supportive
+        volume_sentiment = np.where(dataframe['volume_ratio'] > 1.5, -0.5,  # volume spike can indicate instability
+                                   np.where(dataframe['volume_ratio'] < 0.7, 0.5, 0))  # lighter volume is treated as calmer
         new_columns['market_sentiment'] = ((rsi_sentiment + volatility_sentiment + volume_sentiment) / 3).clip(-1, 1)
         
-        # === translated4reversal ===
+        # === Four-stage reversal warning system ===
         reversal_warnings = self.detect_reversal_warnings_system(dataframe)
         new_columns['reversal_warning_level'] = reversal_warnings['level']
         new_columns['reversal_probability'] = reversal_warnings['probability']
         new_columns['reversal_signal_strength'] = reversal_warnings['signal_strength']
         
-        # 1 times will has new todataframe，useconcatavoid
+        # Add new columns in one batch to avoid repeated dataframe mutations
         if new_columns:
             new_df = pd.DataFrame(new_columns, index=dataframe.index)
             dataframe = pd.concat([dataframe, new_df], axis=1)
@@ -1041,17 +1281,17 @@ translatedReason: {reason}
         return dataframe
     
     def detect_reversal_warnings_system(self, dataframe: DataFrame) -> dict:
-        """🚨 translated4reversal - before2-5translatedKtrend"""
+        """Detect a four-stage reversal warning profile 2-5 candles before a trend reversal."""
         
-        # === 1level warning：momentum-decay detection ===
-        # detect whether trend momentum has started to decay（earliest signal）
+        # === Level 1 warning: momentum decay detection ===
+        # Detect whether trend momentum has started to fade (earliest warning)
         momentum_decay_long = (
             # price gains are shrinking
             (dataframe['close'] - dataframe['close'].shift(3) < 
              dataframe['close'].shift(3) - dataframe['close'].shift(6)) &
             # but price is still rising
             (dataframe['close'] > dataframe['close'].shift(3)) &
-            # ADXfall
+            # ADX is falling
             (dataframe['adx'] < dataframe['adx'].shift(2)) &
             # volume starts shrinking
             (dataframe['volume_ratio'] < dataframe['volume_ratio'].shift(3))
@@ -1063,7 +1303,7 @@ translatedReason: {reason}
              dataframe['close'].shift(3) - dataframe['close'].shift(6)) &
             # but price is still falling
             (dataframe['close'] < dataframe['close'].shift(3)) &
-            # ADXfall
+            # ADX is falling
             (dataframe['adx'] < dataframe['adx'].shift(2)) &
             # volume starts shrinking
             (dataframe['volume_ratio'] < dataframe['volume_ratio'].shift(3))
@@ -1092,13 +1332,13 @@ translatedReason: {reason}
         )
         bullish_rsi_divergence = price_lower_low & rsi_higher_low & (dataframe['rsi_14'] < 35)
         
-        # === 3level warning：abnormal volume distribution（capital-flow shift） ===
+        # === Level 3 warning: abnormal volume distribution (capital rotation) ===
         # heavy selling appears within a bullish trend
         distribution_volume = (
             (dataframe['close'] > dataframe['ema_13']) &  # still in an uptrend
             (dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 1.5) &  # abnormal volume spike
             (dataframe['close'] < dataframe['open']) &  # but closes bearish
-            (dataframe['close'] < (dataframe['high'] + dataframe['low']) / 2)  # atKdown
+            (dataframe['close'] < (dataframe['high'] + dataframe['low']) / 2)  # closes in the lower half of the candle
         )
         
         # heavy buying appears within a bearish trend
@@ -1106,23 +1346,23 @@ translatedReason: {reason}
             (dataframe['close'] < dataframe['ema_13']) &  # still in a downtrend
             (dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 1.5) &  # abnormal volume spike
             (dataframe['close'] > dataframe['open']) &  # but closes bullish
-            (dataframe['close'] > (dataframe['high'] + dataframe['low']) / 2)  # atKup
+            (dataframe['close'] > (dataframe['high'] + dataframe['low']) / 2)  # closes in the upper half of the candle
         )
         
-        # === 4level warning：translated+volatility ===
-        # moving averages begin to converge（the trend is about to end）
+        # === Level 4 warning: trend compression and volatility squeeze ===
+        # Moving averages begin to converge (the trend may be ending)
         ema_convergence = (
             abs(dataframe['ema_5'] - dataframe['ema_13']) < dataframe['atr'] * 0.8
         )
         
-        # abnormal volatility compression（the calm before the storm）
+        # Abnormal volatility compression (the calm before the storm)
         volatility_squeeze = (
             dataframe['atr_p'] < dataframe['atr_p'].rolling(20).quantile(0.3)
         ) & (
             dataframe['bb_width'] < dataframe['bb_width'].rolling(20).quantile(0.2)
         )
         
-        # === calculate the composite warning level ===
+        # === Calculate the composite warning level ===
         warning_level = self._safe_series(0, len(dataframe))
         
         # bullish reversal warning
@@ -1141,18 +1381,18 @@ translatedReason: {reason}
             (ema_convergence & volatility_squeeze).astype(int)
         )
         
-        # warning level：1-4translated，the higher the level, the greater the reversal probability
+        # Warning levels range from 1-4; higher levels imply higher reversal probability
         warning_level = np.maximum(bullish_reversal_signals, bearish_reversal_signals)
         
-        # === reversal-probability calculation ===
-        # probability model based on historical statistics
+        # === Reversal-probability calculation ===
+        # Probability model based on historical observations
         reversal_probability = np.where(
-            warning_level >= 3, 0.75,  # 3-4level warning：75%probability
-            np.where(warning_level == 2, 0.55,  # 2level warning：55%probability
-                    np.where(warning_level == 1, 0.35, 0.1))  # 1level warning：35%probability
+            warning_level >= 3, 0.75,  # level 3-4 warning: 75% probability
+            np.where(warning_level == 2, 0.55,  # level 2 warning: 55% probability
+                    np.where(warning_level == 1, 0.35, 0.1))  # level 1 warning: 35% probability
         )
         
-        # === signal-strength score ===
+        # === Signal-strength score ===
         signal_strength = (
             bullish_reversal_signals * 25 -  # bullish signals are positive
             bearish_reversal_signals * 25    # bearish signals are negative
@@ -1167,27 +1407,27 @@ translatedReason: {reason}
         }
     
     def validate_breakout_effectiveness(self, dataframe: DataFrame) -> dict:
-        """🔍 breakout-validity verification system - breakoutvsbreakout"""
+        """Validate whether a breakout is likely to be genuine or false."""
         
-        # === 1. volume breakout confirmation ===
+        # === 1. Volume breakout confirmation ===
         # breakouts must be accompanied by expanding volume
         volume_breakout_score = np.where(
-            dataframe['volume_ratio'] > 2.0, 3,  # abnormal volume spike：3translated
-            np.where(dataframe['volume_ratio'] > 1.5, 2,  # significant volume expansion：2translated
-                    np.where(dataframe['volume_ratio'] > 1.2, 1, 0))  # moderate volume expansion：1translated，no volume expansion：0translated
+            dataframe['volume_ratio'] > 2.0, 3,  # abnormal volume spike: score 3
+            np.where(dataframe['volume_ratio'] > 1.5, 2,  # significant volume expansion: score 2
+                    np.where(dataframe['volume_ratio'] > 1.2, 1, 0))  # moderate volume expansion: score 1, otherwise 0
         )
         
-        # === 2. price-strength validation ===
+        # === 2. Price-strength validation ===
         # score breakout magnitude and strength
         atr_current = dataframe['atr']
         
         # upward breakout strength
         upward_strength = np.where(
-            # break above the upper Bollinger Band + translated1countATR
+            # break above the upper Bollinger Band by more than one ATR
             (dataframe['close'] > dataframe['bb_upper']) & 
             ((dataframe['close'] - dataframe['bb_upper']) > atr_current), 3,
             np.where(
-                # break above the upper Bollinger Band but1countATR
+                # break above the upper Bollinger Band but by less than one ATR
                 dataframe['close'] > dataframe['bb_upper'], 2,
                 np.where(
                     # break above the Bollinger middle band
@@ -1198,14 +1438,14 @@ translatedReason: {reason}
         
         # downward breakout strength  
         downward_strength = np.where(
-            # break below the lower Bollinger Band + translated1countATR
+            # break below the lower Bollinger Band by more than one ATR
             (dataframe['close'] < dataframe['bb_lower']) & 
             ((dataframe['bb_lower'] - dataframe['close']) > atr_current), -3,
             np.where(
-                # break below the lower Bollinger Band but1countATR
+                # break below the lower Bollinger Band but by less than one ATR
                 dataframe['close'] < dataframe['bb_lower'], -2,
                 np.where(
-                    # Bollinger Bands mid
+                    # below the Bollinger middle band
                     dataframe['close'] < dataframe['bb_middle'], -1, 0
                 )
             )
@@ -1213,8 +1453,8 @@ translatedReason: {reason}
         
         price_strength = upward_strength + downward_strength  # combined score
         
-        # === 3. time-persistence validation ===
-        # follow-through confirmation after the breakout（after2-3translatedKtranslated）
+        # === 3. Time-persistence validation ===
+        # Confirm follow-through after the breakout in the next 1-3 candles
         breakout_persistence = self._safe_series(0, len(dataframe))
         
         # upward-breakout persistence
@@ -1237,58 +1477,58 @@ translatedReason: {reason}
         # detect common fake-breakout patterns
         false_breakout_penalty = self._safe_series(0, len(dataframe))
         
-        # fake breakout with an overly long upper wick（pushes up and then fades）
+        # fake breakout with an overly long upper wick (pushes up and then fades)
         long_upper_shadow = (
             (dataframe['high'] - dataframe['close']) > (dataframe['close'] - dataframe['open']) * 2
         ) & (dataframe['close'] > dataframe['open'])  # bullish candle but upper wick is too long
         false_breakout_penalty -= long_upper_shadow.astype(int) * 2
         
-        # fake breakout with an overly long lower wick（dips and then rebounds）
+        # fake breakout with an overly long lower wick (dips and then rebounds)
         long_lower_shadow = (
             (dataframe['close'] - dataframe['low']) > (dataframe['open'] - dataframe['close']) * 2
         ) & (dataframe['close'] < dataframe['open'])  # bearish candle but lower wick is too long
         false_breakout_penalty -= long_lower_shadow.astype(int) * 2
         
-        # === 5. technical-indicator confirmation ===
-        # RSItranslatedMACDconfirm
+        # === 5. Technical-indicator confirmation ===
+        # Confirm with RSI and MACD alignment
         technical_confirmation = self._safe_series(0, len(dataframe))
         
         # bullish breakout confirmation
         bullish_tech_confirm = (
-            (dataframe['rsi_14'] > 50) &  # RSItranslated
-            (dataframe['macd_hist'] > 0) &  # MACDas
+            (dataframe['rsi_14'] > 50) &  # RSI supports the breakout
+            (dataframe['macd_hist'] > 0) &  # MACD histogram is positive
             (dataframe['trend_strength'] > 0)  # trend strength is positive
         ).astype(int) * 2
         
         # bearish breakout confirmation
         bearish_tech_confirm = (
-            (dataframe['rsi_14'] < 50) &  # RSItranslated
-            (dataframe['macd_hist'] < 0) &  # MACDas
+            (dataframe['rsi_14'] < 50) &  # RSI supports the breakout
+            (dataframe['macd_hist'] < 0) &  # MACD histogram is negative
             (dataframe['trend_strength'] < 0)  # trend strength is negative
         ).astype(int) * -2
         
         technical_confirmation = bullish_tech_confirm + bearish_tech_confirm
         
-        # === 6. has score ===
-        # weight allocation
+        # === 6. Composite scoring ===
+        # Weight allocation
         validity_score = (
-            volume_breakout_score * 0.30 +      # volume confirmation：30%
-            price_strength * 0.25 +             # price strength：25%
-            breakout_persistence * 0.20 +       # translated：20%
-            technical_confirmation * 0.15 +     # confirm：15%
-            false_breakout_penalty * 0.10       # breakout：10%
+            volume_breakout_score * 0.30 +      # volume confirmation: 30%
+            price_strength * 0.25 +             # price strength: 25%
+            breakout_persistence * 0.20 +       # follow-through persistence: 20%
+            technical_confirmation * 0.15 +     # technical confirmation: 15%
+            false_breakout_penalty * 0.10       # false-breakout penalty: 10%
         ).clip(-10, 10)
         
-        # === 7. calculate ===
-        # score calculate breakout
+        # === 7. Confidence calculation ===
+        # Map the score to a breakout-confidence estimate
         confidence = np.where(
-            abs(validity_score) >= 6, 0.85,  # high confidence：85%
-            np.where(abs(validity_score) >= 4, 0.70,  # medium confidence：70%
-                    np.where(abs(validity_score) >= 2, 0.55,  # low confidence：55%
-                            0.30))  # very low confidence：30%
+            abs(validity_score) >= 6, 0.85,  # high confidence: 85%
+            np.where(abs(validity_score) >= 4, 0.70,  # medium confidence: 70%
+                    np.where(abs(validity_score) >= 2, 0.55,  # low confidence: 55%
+                            0.30))  # very low confidence: 30%
         )
         
-        # === 8. breakout ===
+        # === 8. Breakout classification ===
         breakout_type = self._safe_series('NONE', len(dataframe), 'NONE')
         
         # strong breakout
@@ -1319,9 +1559,9 @@ translatedReason: {reason}
         }
     
     def calculate_market_regime_simple(self, dataframe: DataFrame) -> DataFrame:
-        """simplified market-state detection - optimizeDataFrametranslated"""
+        """Simplified market-regime detection with low-overhead dataframe writes."""
         
-        # 1 times calculate has，avoidDataFrametranslated
+        # Collect new columns first to avoid repeated dataframe mutations
         new_columns = {}
         
         # determine market type based on trend strength and volatility state
@@ -1344,11 +1584,11 @@ translatedReason: {reason}
         
         new_columns['market_sentiment'] = (price_vs_ma * 10 + volume_sentiment) / 2
         
-        # use value has new，avoidconcattranslated
+        # Assign the new values directly once they are prepared
         if new_columns:
             for col_name, value in new_columns.items():
                 if isinstance(value, pd.Series):
-                    # translatedSerieslong anddataframetranslated
+                    # Align the series length with the dataframe when possible
                     if len(value) == len(dataframe):
                         dataframe[col_name] = value.values
                     else:
@@ -1359,8 +1599,8 @@ translatedReason: {reason}
         return dataframe
     
     def ichimoku(self, dataframe: DataFrame, tenkan=9, kijun=26, senkou_b=52) -> DataFrame:
-        """Ichimoku cloud indicators - optimizeDataFrametranslated"""
-        # batch-calculate all indicators
+        """Calculate Ichimoku cloud indicators with batched writes."""
+        # Batch-calculate all indicators
         new_columns = {}
         
         new_columns['tenkan'] = (dataframe['high'].rolling(tenkan).max() + dataframe['low'].rolling(tenkan).min()) / 2
@@ -1369,11 +1609,11 @@ translatedReason: {reason}
         new_columns['senkou_b'] = ((dataframe['high'].rolling(senkou_b).max() + dataframe['low'].rolling(senkou_b).min()) / 2).shift(kijun)
         new_columns['chikou'] = dataframe['close'].shift(-kijun)
         
-        # use value has new，avoidconcattranslated
+        # Add the generated columns in one batch
         if new_columns:
             for col_name, value in new_columns.items():
                 if isinstance(value, pd.Series):
-                    # translatedSerieslong anddataframetranslated
+                    # Align the series length with the dataframe when possible
                     if len(value) == len(dataframe):
                         dataframe[col_name] = value.values
                     else:
@@ -1410,9 +1650,9 @@ translatedReason: {reason}
         return supertrend
     
     def calculate_advanced_volatility_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """calculate advanced volatility indicators"""
+        """Calculate advanced volatility indicators."""
         
-        # Keltner translated（translatedATRtranslated）
+        # Keltner Channel (ATR-based envelope)
         kc_period = 20
         kc_multiplier = 2
         kc_middle = ta.EMA(dataframe, timeperiod=kc_period)
@@ -1425,7 +1665,7 @@ translatedReason: {reason}
                                         0)
         dataframe['kc_position'] = (dataframe['close'] - dataframe['kc_lower']) / (dataframe['kc_upper'] - dataframe['kc_lower'])
         
-        # Donchian translated（breakout）
+        # Donchian Channel (breakout range)
         dc_period = 20
         dataframe['dc_upper'] = dataframe['high'].rolling(dc_period).max()
         dataframe['dc_lower'] = dataframe['low'].rolling(dc_period).min()
@@ -1434,55 +1674,55 @@ translatedReason: {reason}
                                         (dataframe['dc_upper'] - dataframe['dc_lower']) / dataframe['dc_middle'], 
                                         0)
         
-        # Bollinger Bandwidth（volatility）
-        dataframe['bb_bandwidth'] = dataframe['bb_width']  # at indicator mid calculate
+        # Bollinger Bandwidth (volatility compression/expansion)
+        dataframe['bb_bandwidth'] = dataframe['bb_width']  # already calculated in the core indicator block
         dataframe['bb_squeeze'] = (dataframe['bb_bandwidth'] < dataframe['bb_bandwidth'].rolling(20).quantile(0.2)).astype(int)
         
-        # Chaikin Volatility（volume volatility）
+        # Chaikin Volatility
         cv_period = 10
         hl_ema = ta.EMA(dataframe['high'] - dataframe['low'], timeperiod=cv_period)
         dataframe['chaikin_volatility'] = ((hl_ema - hl_ema.shift(cv_period)) / hl_ema.shift(cv_period)) * 100
         
-        # volatility（VIXtranslated）
+        # Realized volatility proxy (VIX-style approximation)
         returns = dataframe['close'].pct_change()
         dataframe['volatility_index'] = returns.rolling(20).std() * np.sqrt(365) * 100  # volatility
         
         return dataframe
     
     def calculate_advanced_momentum_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """calculate advanced momentum indicators"""
+        """Calculate advanced momentum indicators."""
         
-        # Fisher Transform（price）
+        # Fisher Transform (price normalization)
         dataframe = self.fisher_transform(dataframe)
         
-        # KSTindicator（translatedROCtranslated）
+        # KST indicator (multi-horizon ROC blend)
         dataframe = self.kst_indicator(dataframe)
         
-        # Coppocktranslated（long momentum indicators）
+        # Coppock Curve (longer-horizon momentum)
         dataframe = self.coppock_curve(dataframe)
         
-        # Vortexindicator（trend strength）
+        # Vortex indicator (trend strength)
         dataframe = self.vortex_indicator(dataframe)
         
-        # Stochastic Momentum Index（SMI）
+        # Stochastic Momentum Index (SMI)
         dataframe = self.stochastic_momentum_index(dataframe)
         
-        # True Strength Index（TSI）
+        # True Strength Index (TSI)
         dataframe = self.true_strength_index(dataframe)
         
         return dataframe
     
     def fisher_transform(self, dataframe: DataFrame, period: int = 10) -> DataFrame:
-        """calculateFisher Transformindicator"""
+        """Calculate the Fisher Transform indicator."""
         hl2 = (dataframe['high'] + dataframe['low']) / 2
         
-        # calculate price most large value most small value
+        # Rolling high/low range for normalization
         high_n = hl2.rolling(period).max()
         low_n = hl2.rolling(period).min()
         
-        # price to-1to1translated
+        # Normalize price into the [-1, 1] range
         normalized_price = 2 * ((hl2 - low_n) / (high_n - low_n) - 0.5)
-        normalized_price = normalized_price.clip(-0.999, 0.999)  # translated
+        normalized_price = normalized_price.clip(-0.999, 0.999)  # prevent log singularities
         
         # Fisher Transform
         fisher = self._safe_series(0.0, len(dataframe))
@@ -1501,54 +1741,54 @@ translatedReason: {reason}
         return dataframe
     
     def kst_indicator(self, dataframe: DataFrame) -> DataFrame:
-        """calculateKST (Know Sure Thing) indicator"""
-        # 4 countROCtranslated
+        """Calculate the KST (Know Sure Thing) indicator."""
+        # Four rate-of-change components
         roc1 = ta.ROC(dataframe, timeperiod=10)
         roc2 = ta.ROC(dataframe, timeperiod=15)
         roc3 = ta.ROC(dataframe, timeperiod=20)
         roc4 = ta.ROC(dataframe, timeperiod=30)
         
-        # translatedROCtranslated
+        # Smooth each ROC series
         roc1_ma = ta.SMA(roc1, timeperiod=10)
         roc2_ma = ta.SMA(roc2, timeperiod=10)
         roc3_ma = ta.SMA(roc3, timeperiod=10)
         roc4_ma = ta.SMA(roc4, timeperiod=15)
         
-        # KSTcalculate（translated）
+        # Build the weighted KST line
         dataframe['kst'] = (roc1_ma * 1) + (roc2_ma * 2) + (roc3_ma * 3) + (roc4_ma * 4)
         dataframe['kst_signal'] = ta.SMA(dataframe['kst'], timeperiod=9)
         
         return dataframe
     
     def coppock_curve(self, dataframe: DataFrame, wma_period: int = 10) -> DataFrame:
-        """calculateCoppocktranslated"""
-        # Coppock ROCcalculate
+        """Calculate the Coppock Curve."""
+        # Coppock ROC inputs
         roc11 = ta.ROC(dataframe, timeperiod=11)
         roc14 = ta.ROC(dataframe, timeperiod=14)
         
-        # countROCtranslated
+        # Combine the ROC components
         roc_sum = roc11 + roc14
         
-        # translated
+        # Weighted moving average of the combined ROC
         dataframe['coppock'] = ta.WMA(roc_sum, timeperiod=wma_period)
         
         return dataframe
     
     def vortex_indicator(self, dataframe: DataFrame, period: int = 14) -> DataFrame:
-        """calculateVortexindicator"""
+        """Calculate the Vortex indicator."""
         # True Range
         tr = ta.TRANGE(dataframe)
         
-        # translated
+        # Positive and negative vortex movement
         vm_plus = abs(dataframe['high'] - dataframe['low'].shift(1))
         vm_minus = abs(dataframe['low'] - dataframe['high'].shift(1))
         
-        # translated
+        # Rolling sums used to form VI+/VI-
         vm_plus_sum = vm_plus.rolling(period).sum()
         vm_minus_sum = vm_minus.rolling(period).sum()
         tr_sum = tr.rolling(period).sum()
         
-        # VIcalculate
+        # Final Vortex values
         dataframe['vi_plus'] = vm_plus_sum / tr_sum
         dataframe['vi_minus'] = vm_minus_sum / tr_sum
         dataframe['vi_diff'] = dataframe['vi_plus'] - dataframe['vi_minus']
@@ -1556,11 +1796,11 @@ translatedReason: {reason}
         return dataframe
     
     def stochastic_momentum_index(self, dataframe: DataFrame, k_period: int = 10, d_period: int = 3) -> DataFrame:
-        """calculate momentum (SMI)"""
-        # price mid
+        """Calculate the Stochastic Momentum Index (SMI)."""
+        # Midpoint of the recent trading range
         mid_point = (dataframe['high'].rolling(k_period).max() + dataframe['low'].rolling(k_period).min()) / 2
         
-        # calculateSMI
+        # Build the SMI numerator and denominator
         numerator = (dataframe['close'] - mid_point).rolling(k_period).sum()
         denominator = (dataframe['high'].rolling(k_period).max() - dataframe['low'].rolling(k_period).min()).rolling(k_period).sum() / 2
         
@@ -1571,40 +1811,40 @@ translatedReason: {reason}
         return dataframe
     
     def true_strength_index(self, dataframe: DataFrame, r: int = 25, s: int = 13) -> DataFrame:
-        """calculate strength (TSI)"""
-        # price
+        """Calculate the True Strength Index (TSI)."""
+        # Price change
         price_change = dataframe['close'].diff()
         
-        # times price
+        # Double-smoothed price change
         first_smooth_pc = price_change.ewm(span=r).mean()
         double_smooth_pc = first_smooth_pc.ewm(span=s).mean()
         
-        # times value price
+        # Double-smoothed absolute price change
         first_smooth_abs_pc = abs(price_change).ewm(span=r).mean()
         double_smooth_abs_pc = first_smooth_abs_pc.ewm(span=s).mean()
         
-        # TSIcalculate
+        # Final TSI values
         dataframe['tsi'] = 100 * (double_smooth_pc / double_smooth_abs_pc)
         dataframe['tsi_signal'] = dataframe['tsi'].ewm(span=7).mean()
         
         return dataframe
     
     def calculate_advanced_volume_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """calculate high volume indicators"""
+        """Calculate advanced volume indicators."""
         
-        # Accumulation/Distribution Line（A/Dtranslated）
+        # Accumulation/Distribution Line (A/D)
         dataframe['ad_line'] = ta.AD(dataframe)
         dataframe['ad_line_ma'] = ta.SMA(dataframe['ad_line'], timeperiod=20)
         
-        # Money Flow Index（MFI - volumeRSI）
+        # Money Flow Index (MFI, volume-weighted RSI-like oscillator)
         dataframe['mfi'] = ta.MFI(dataframe, timeperiod=14)
         
-        # Force Index（translated）
+        # Force Index
         force_index = (dataframe['close'] - dataframe['close'].shift(1)) * dataframe['volume']
         dataframe['force_index'] = force_index.ewm(span=13).mean()
         dataframe['force_index_ma'] = force_index.rolling(20).mean()
         
-        # Ease of Movement（translated）
+        # Ease of Movement
         high_low_avg = (dataframe['high'] + dataframe['low']) / 2
         high_low_avg_prev = high_low_avg.shift(1)
         distance_moved = high_low_avg - high_low_avg_prev
@@ -1615,13 +1855,13 @@ translatedReason: {reason}
         emv_1 = distance_moved / (box_ratio + 1e-10)
         dataframe['emv'] = emv_1.rolling(14).mean()
         
-        # Chaikin Money Flow（CMF）
+        # Chaikin Money Flow (CMF)
         money_flow_multiplier = ((dataframe['close'] - dataframe['low']) - 
                                (dataframe['high'] - dataframe['close'])) / (dataframe['high'] - dataframe['low'] + 1e-10)
         money_flow_volume = money_flow_multiplier * dataframe['volume']
         dataframe['cmf'] = money_flow_volume.rolling(20).sum() / (dataframe['volume'].rolling(20).sum() + 1e-10)
         
-        # Volume Price Trend（VPT）
+        # Volume Price Trend (VPT)
         vpt = (dataframe['volume'] * ((dataframe['close'] - dataframe['close'].shift(1)) / (dataframe['close'].shift(1) + 1e-10)))
         dataframe['vpt'] = vpt.cumsum()
         dataframe['vpt_ma'] = dataframe['vpt'].rolling(20).mean()
@@ -1629,78 +1869,78 @@ translatedReason: {reason}
         return dataframe
     
     def calculate_market_structure_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """calculate market-structure indicators"""
+        """Calculate market-structure indicators."""
         
-        # Price Actionindicator
+        # Price action indicators
         dataframe = self.calculate_price_action_indicators(dataframe)
         
         # support/resistance
         dataframe = self.identify_support_resistance(dataframe)
         
-        # translated
+        # Wave structure analysis
         dataframe = self.calculate_wave_analysis(dataframe)
         
-        # price
+        # Price-density analysis
         dataframe = self.calculate_price_density(dataframe)
         
         return dataframe
     
     def calculate_price_action_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """calculate price as indicator"""
-        # large small
+        """Calculate price-action indicators."""
+        # Candle body size
         dataframe['real_body'] = abs(dataframe['close'] - dataframe['open'])
         dataframe['real_body_pct'] = dataframe['real_body'] / (dataframe['close'] + 1e-10) * 100
         
-        # up down
+        # Upper and lower shadows
         dataframe['upper_shadow'] = dataframe['high'] - dataframe[['open', 'close']].max(axis=1)
         dataframe['lower_shadow'] = dataframe[['open', 'close']].min(axis=1) - dataframe['low']
         
-        # Ktranslated
+        # Basic candlestick classifications
         dataframe['is_doji'] = (dataframe['real_body_pct'] < 0.1).astype(int)
         dataframe['is_hammer'] = ((dataframe['lower_shadow'] > dataframe['real_body'] * 2) & 
                                  (dataframe['upper_shadow'] < dataframe['real_body'] * 0.5)).astype(int)
         dataframe['is_shooting_star'] = ((dataframe['upper_shadow'] > dataframe['real_body'] * 2) & 
                                         (dataframe['lower_shadow'] < dataframe['real_body'] * 0.5)).astype(int)
         
-        # Pin Bar translated
-        # Pin Bar Bullish: long down，small，short up，signal
+        # Pin bars
+        # Bullish pin bar: long lower shadow, small body, short upper shadow
         dataframe['is_pin_bar_bullish'] = ((dataframe['lower_shadow'] > dataframe['real_body'] * 2) & 
                                           (dataframe['upper_shadow'] < dataframe['real_body']) &
-                                          (dataframe['real_body_pct'] < 2.0) &  # small
-                                          (dataframe['close'] > dataframe['open'])).astype(int)  # translated
+                                          (dataframe['real_body_pct'] < 2.0) &  # small body
+                                          (dataframe['close'] > dataframe['open'])).astype(int)  # bullish close
         
-        # Pin Bar Bearish: long up，small，short down，signal
+        # Bearish pin bar: long upper shadow, small body, short lower shadow
         dataframe['is_pin_bar_bearish'] = ((dataframe['upper_shadow'] > dataframe['real_body'] * 2) & 
                                           (dataframe['lower_shadow'] < dataframe['real_body']) &
-                                          (dataframe['real_body_pct'] < 2.0) &  # small
-                                          (dataframe['close'] < dataframe['open'])).astype(int)  # translated
+                                          (dataframe['real_body_pct'] < 2.0) &  # small body
+                                          (dataframe['close'] < dataframe['open'])).astype(int)  # bearish close
         
-        # translated
-        # before get before 1Ktranslated
+        # Engulfing patterns
+        # Capture the previous candle for comparison
         prev_open = dataframe['open'].shift(1)
         prev_close = dataframe['close'].shift(1)
         prev_high = dataframe['high'].shift(1)
         prev_low = dataframe['low'].shift(1)
         
-        # translated：before before 1
-        dataframe['is_bullish_engulfing'] = ((dataframe['close'] > dataframe['open']) &  # before as
-                                           (prev_close < prev_open) &  # before 1 as
-                                           (dataframe['open'] < prev_close) &  # before low before 1
-                                           (dataframe['close'] > prev_open) &  # before high before 1
-                                           (dataframe['real_body'] > dataframe['real_body'].shift(1) * 1.2)).astype(int)  # before large
+        # Bullish engulfing: current bullish body fully engulfs the previous bearish body
+        dataframe['is_bullish_engulfing'] = ((dataframe['close'] > dataframe['open']) &  # current candle is bullish
+                                           (prev_close < prev_open) &  # previous candle is bearish
+                                           (dataframe['open'] < prev_close) &  # open below prior close
+                                           (dataframe['close'] > prev_open) &  # close above prior open
+                                           (dataframe['real_body'] > dataframe['real_body'].shift(1) * 1.2)).astype(int)  # stronger body
         
-        # translated：before before 1
-        dataframe['is_bearish_engulfing'] = ((dataframe['close'] < dataframe['open']) &  # before as
-                                           (prev_close > prev_open) &  # before 1 as
-                                           (dataframe['open'] > prev_close) &  # before high before 1
-                                           (dataframe['close'] < prev_open) &  # before low before 1
-                                           (dataframe['real_body'] > dataframe['real_body'].shift(1) * 1.2)).astype(int)  # before large
+        # Bearish engulfing: current bearish body fully engulfs the previous bullish body
+        dataframe['is_bearish_engulfing'] = ((dataframe['close'] < dataframe['open']) &  # current candle is bearish
+                                           (prev_close > prev_open) &  # previous candle is bullish
+                                           (dataframe['open'] > prev_close) &  # open above prior close
+                                           (dataframe['close'] < prev_open) &  # close below prior open
+                                           (dataframe['real_body'] > dataframe['real_body'].shift(1) * 1.2)).astype(int)  # stronger body
         
         return dataframe
     
     def identify_support_resistance(self, dataframe: DataFrame, window: int = 20) -> DataFrame:
-        """support resistance"""
-        # calculate has support resistance indicator，1 times avoid
+        """Identify basic support and resistance structure."""
+        # Build support/resistance columns in one pass
         sr_columns = {
             'local_max': dataframe['high'].rolling(window, center=True).max() == dataframe['high'],
             'local_min': dataframe['low'].rolling(window, center=True).min() == dataframe['low'],
@@ -1716,8 +1956,8 @@ translatedReason: {reason}
         return pd.concat([dataframe, sr_df], axis=1)
     
     def calculate_wave_analysis(self, dataframe: DataFrame) -> DataFrame:
-        """calculate indicator"""
-        # Elliott Waveindicator，1 times calculate avoid
+        """Calculate simple wave-structure indicators."""
+        # Lightweight wave-proxy indicators collected in one pass
         returns = dataframe['close'].pct_change()
         
         wave_columns = {
@@ -1730,22 +1970,22 @@ translatedReason: {reason}
         return pd.concat([dataframe, wave_df], axis=1)
     
     def calculate_price_density(self, dataframe: DataFrame) -> DataFrame:
-        """calculate price indicator - optimizeDataFrametranslated"""
-        # 1 times calculate has
+        """Calculate price-density indicators with minimal dataframe churn."""
+        # Collect new columns before assignment
         new_columns = {}
         
-        # price
+        # Candle range as a percentage of price
         price_range = dataframe['high'] - dataframe['low']
         new_columns['price_range_pct'] = price_range / (dataframe['close'] + 1e-10) * 100
         
-        # simplified price calculate
-        new_columns['price_density'] = 1 / (new_columns['price_range_pct'] + 0.1)  # price small high
+        # Narrower ranges imply denser price action
+        new_columns['price_density'] = 1 / (new_columns['price_range_pct'] + 0.1)  # small ranges yield higher density
         
-        # use value has new，avoidconcattranslated
+        # Assign the prepared values directly
         if new_columns:
             for col_name, value in new_columns.items():
                 if isinstance(value, pd.Series):
-                    # translatedSerieslong anddataframetranslated
+                    # Align the series length with the dataframe when possible
                     if len(value) == len(dataframe):
                         dataframe[col_name] = value.values
                     else:
@@ -1756,9 +1996,9 @@ translatedReason: {reason}
         return dataframe
     
     def calculate_composite_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """calculate indicator - optimizeDataFrametranslated"""
+        """Calculate higher-level composite indicators."""
         
-        # 1 times calculate has
+        # Collect new columns before assignment
         new_columns = {}
         
         # momentum score
@@ -1776,14 +2016,14 @@ translatedReason: {reason}
         # risk adjustment indicator
         new_columns['risk_adjusted_return'] = self.calculate_risk_adjusted_returns(dataframe)
         
-        # translated
+        # Overall technical health summary
         new_columns['technical_health'] = self.calculate_technical_health(dataframe)
         
-        # use value has new，avoidconcattranslated
+        # Assign the prepared values directly
         if new_columns:
             for col_name, value in new_columns.items():
                 if isinstance(value, pd.Series):
-                    # translatedSerieslong anddataframetranslated
+                    # Align the series length with the dataframe when possible
                     if len(value) == len(dataframe):
                         dataframe[col_name] = value.values
                     else:
@@ -1794,13 +2034,13 @@ translatedReason: {reason}
         return dataframe
     
     def calculate_momentum_score(self, dataframe: DataFrame) -> pd.Series:
-        """calculate momentum score"""
-        # count momentum indicators
+        """Calculate a composite momentum score."""
+        # Collect normalized momentum indicators
         momentum_indicators = {}
         
-        # momentum indicators
+        # Core momentum indicators
         if 'rsi_14' in dataframe.columns:
-            momentum_indicators['rsi_14'] = (dataframe['rsi_14'] - 50) / 50  # translatedRSI
+            momentum_indicators['rsi_14'] = (dataframe['rsi_14'] - 50) / 50  # normalized RSI
         if 'mom_10' in dataframe.columns:
             momentum_indicators['mom_10'] = np.where(dataframe['close'] > 0, 
                                                      dataframe['mom_10'] / dataframe['close'] * 100, 
@@ -1810,11 +2050,11 @@ translatedReason: {reason}
         if 'macd' in dataframe.columns:
             momentum_indicators['macd_normalized'] = np.where(dataframe['close'] > 0, 
                                                              dataframe['macd'] / dataframe['close'] * 1000, 
-                                                             0)  # translatedMACD
+                                                             0)  # normalized MACD
         
-        # advanced momentum indicators
+        # Advanced momentum indicators
         if 'kst' in dataframe.columns:
-            momentum_indicators['kst_normalized'] = dataframe['kst'] / abs(dataframe['kst']).rolling(20).mean()  # translatedKST
+            momentum_indicators['kst_normalized'] = dataframe['kst'] / abs(dataframe['kst']).rolling(20).mean()  # normalized KST
         if 'fisher' in dataframe.columns:
             momentum_indicators['fisher'] = dataframe['fisher']  # Fisher Transform
         if 'tsi' in dataframe.columns:
@@ -1822,7 +2062,7 @@ translatedReason: {reason}
         if 'vi_diff' in dataframe.columns:
             momentum_indicators['vi_diff'] = dataframe['vi_diff']  # Vortexvalue
         
-        # translated
+        # Indicator weights
         weights = {
             'rsi_14': 0.15, 'mom_10': 0.10, 'roc_10': 0.10, 'macd_normalized': 0.15,
             'kst_normalized': 0.15, 'fisher': 0.15, 'tsi': 0.10, 'vi_diff': 0.10
@@ -1833,21 +2073,21 @@ translatedReason: {reason}
         for indicator, weight in weights.items():
             if indicator in momentum_indicators:
                 normalized_indicator = momentum_indicators[indicator].fillna(0)
-                # at-1to1translated
+                # Clip each indicator into a bounded range before weighting
                 normalized_indicator = normalized_indicator.clip(-3, 3) / 3
                 momentum_score += normalized_indicator * weight
         
         return momentum_score.clip(-1, 1)
     
     def calculate_trend_strength_score(self, dataframe: DataFrame) -> pd.Series:
-        """calculate trend strength score"""
-        # trend indicator
+        """Calculate a composite trend-strength score."""
+        # Collect normalized trend indicators
         trend_indicators = {}
         
         if 'adx' in dataframe.columns:
-            trend_indicators['adx'] = dataframe['adx'] / 100  # ADXtranslated
+            trend_indicators['adx'] = dataframe['adx'] / 100  # normalized ADX
         
-        # EMAtranslated
+        # EMA alignment score
         trend_indicators['ema_trend'] = self.calculate_ema_trend_score(dataframe)
         
         # SuperTrend
@@ -1856,7 +2096,7 @@ translatedReason: {reason}
         # Ichimoku
         trend_indicators['ichimoku_trend'] = self.calculate_ichimoku_score(dataframe)
         
-        # trend
+        # Linear regression trend estimate
         trend_indicators['linear_reg_trend'] = self.calculate_linear_regression_trend(dataframe)
         
         weights = {
@@ -1874,17 +2114,17 @@ translatedReason: {reason}
         return trend_score.clip(-1, 1)
     
     def calculate_ema_trend_score(self, dataframe: DataFrame) -> pd.Series:
-        """calculateEMAtrend score"""
+        """Calculate a trend score from EMA alignment."""
         score = self._safe_series(0.0, len(dataframe))
         
-        # EMAtranslated
+        # EMA stack alignment
         if all(col in dataframe.columns for col in ['ema_8', 'ema_21', 'ema_50']):
             # bullish: EMA8 > EMA21 > EMA50
             score += (dataframe['ema_8'] > dataframe['ema_21']).astype(int) * 0.4
             score += (dataframe['ema_21'] > dataframe['ema_50']).astype(int) * 0.3
             score += (dataframe['close'] > dataframe['ema_8']).astype(int) * 0.3
             
-            # bearish：translated
+            # bearish EMA alignment
             score -= (dataframe['ema_8'] < dataframe['ema_21']).astype(int) * 0.4
             score -= (dataframe['ema_21'] < dataframe['ema_50']).astype(int) * 0.3
             score -= (dataframe['close'] < dataframe['ema_8']).astype(int) * 0.3
@@ -1892,36 +2132,36 @@ translatedReason: {reason}
         return score.clip(-1, 1)
     
     def calculate_supertrend_score(self, dataframe: DataFrame) -> pd.Series:
-        """calculateSuperTrendscore"""
+        """Calculate a trend score from SuperTrend positioning."""
         if 'supertrend' not in dataframe.columns:
             return self._safe_series(0.0, len(dataframe))
         
-        # SuperTrendtranslated
+        # Price relative to SuperTrend
         trend_score = ((dataframe['close'] > dataframe['supertrend']).astype(int) * 2 - 1)
         
-        # translated
+        # Scale conviction by distance from the SuperTrend line
         distance_factor = np.where(dataframe['close'] > 0, 
                                   abs(dataframe['close'] - dataframe['supertrend']) / dataframe['close'], 
                                   0)
-        distance_factor = distance_factor.clip(0, 0.1) / 0.1  # most10%translated
+        distance_factor = distance_factor.clip(0, 0.1) / 0.1  # cap the effect at 10%
         
         return trend_score * distance_factor
     
     def calculate_ichimoku_score(self, dataframe: DataFrame) -> pd.Series:
-        """calculateIchimokuscore"""
+        """Calculate a trend score from Ichimoku signals."""
         score = self._safe_series(0.0, len(dataframe))
         
-        # Ichimokusignal
+        # Ichimoku cloud signals
         if all(col in dataframe.columns for col in ['tenkan', 'kijun', 'senkou_a', 'senkou_b']):
-            # price at up
+            # Price above the cloud
             above_cloud = ((dataframe['close'] > dataframe['senkou_a']) & 
                           (dataframe['close'] > dataframe['senkou_b'])).astype(int)
             
-            # price at down
+            # Price below the cloud
             below_cloud = ((dataframe['close'] < dataframe['senkou_a']) & 
                           (dataframe['close'] < dataframe['senkou_b'])).astype(int)
             
-            # Tenkan-Kijuntranslated
+            # Tenkan/Kijun alignment
             tenkan_above_kijun = (dataframe['tenkan'] > dataframe['kijun']).astype(int)
             
             score = (above_cloud * 0.5 + tenkan_above_kijun * 0.3 + 
@@ -1931,43 +2171,43 @@ translatedReason: {reason}
         return score.clip(-1, 1)
     
     def calculate_linear_regression_trend(self, dataframe: DataFrame, period: int = 20) -> pd.Series:
-        """calculate trend"""
+        """Calculate a linear-regression-based trend score."""
         def linear_reg_slope(y):
             if len(y) < 2:
                 return 0
             x = np.arange(len(y))
             from scipy import stats
             slope, _, r_value, _, _ = stats.linregress(x, y)
-            return slope * r_value ** 2  # toRtranslated
+            return slope * r_value ** 2  # scale slope by fit quality
         
-        # calculate
+        # Rolling regression slope
         reg_slope = dataframe['close'].rolling(period).apply(linear_reg_slope, raw=False)
         
-        # translated
+        # Normalize the slope relative to price
         normalized_slope = np.where(dataframe['close'] > 0, 
                                    reg_slope / dataframe['close'] * 1000, 
-                                   0)  # large
+                                   0)  # scale into a usable range
         
         return normalized_slope.fillna(0).clip(-1, 1)
     
     def calculate_volatility_regime(self, dataframe: DataFrame) -> pd.Series:
-        """calculate volatility"""
-        # before volatility
+        """Calculate a simple volatility regime classifier."""
+        # Current ATR-based volatility
         current_vol = dataframe['atr_p']
         
-        # volatility
+        # Volatility percentile over a rolling window
         vol_percentile = current_vol.rolling(100).rank(pct=True)
         
-        # volatility
-        regime = self._safe_series(0, len(dataframe))  # 0: mid
+        # Regime buckets
+        regime = self._safe_series(0, len(dataframe))  # 0: medium volatility
         regime[vol_percentile < 0.2] = -1  # low volatility
         regime[vol_percentile > 0.8] = 1   # high volatility
         
         return regime
     
     def calculate_market_regime(self, dataframe: DataFrame) -> pd.Series:
-        """calculate market state score"""
-        # count
+        """Calculate a composite market-regime score."""
+        # Collect regime factors
         regime_factors = {}
         
         if 'trend_strength_score' in dataframe.columns:
@@ -1975,7 +2215,7 @@ translatedReason: {reason}
         if 'momentum_score' in dataframe.columns:
             regime_factors['momentum'] = dataframe['momentum_score']
         if 'volatility_regime' in dataframe.columns:
-            regime_factors['volatility'] = dataframe['volatility_regime'] / 2  # translated
+            regime_factors['volatility'] = dataframe['volatility_regime'] / 2  # reduce volatility weight into the same scale
         if 'volume_ratio' in dataframe.columns:
             regime_factors['volume_trend'] = (dataframe['volume_ratio'] - 1).clip(-1, 1)
         
@@ -1988,13 +2228,13 @@ translatedReason: {reason}
         
         return market_regime.clip(-1, 1)
     
-    # translated calculate_risk_adjusted_returns - simplified
+    # Simplified risk-adjusted return calculation
     def calculate_risk_adjusted_returns(self, dataframe: DataFrame, window: int = 20) -> pd.Series:
-        """calculate risk adjustment"""
-        # calculate
+        """Calculate a simplified risk-adjusted return series."""
+        # Price returns
         returns = dataframe['close'].pct_change()
         
-        # translatedSharpetranslated
+        # Rolling Sharpe-like estimate
         rolling_returns = returns.rolling(window).mean()
         rolling_std = returns.rolling(window).std()
         
@@ -2003,50 +2243,50 @@ translatedReason: {reason}
         return risk_adjusted.fillna(0)
     
     def identify_coin_risk_tier(self, pair: str, dataframe: DataFrame) -> str:
-        """🎯 risk level - features"""
+        """Classify the pair into a simple coin risk tier."""
         
         try:
-            if dataframe.empty or len(dataframe) < 96:  # translated
+            if dataframe.empty or len(dataframe) < 96:  # need roughly 24 hours of 15m data
                 return 'medium_risk'  # default medium risk
                 
             current_idx = -1
             
-            # === features1: pricevolatility analysis ===
+            # === Factor 1: price volatility analysis ===
             volatility = dataframe['atr_p'].iloc[current_idx] if 'atr_p' in dataframe.columns else 0.05
             volatility_24h = dataframe['close'].rolling(96).std().iloc[current_idx] / dataframe['close'].iloc[current_idx]
             
-            # === features2: translated ===
+            # === Factor 2: volume stability ===
             volume_series = dataframe['volume'].rolling(24)
             volume_mean = volume_series.mean().iloc[current_idx]
             volume_std = volume_series.std().iloc[current_idx]
-            volume_cv = (volume_std / volume_mean) if volume_mean > 0 else 5  # translated
+            volume_cv = (volume_std / volume_mean) if volume_mean > 0 else 5  # coefficient of variation
             
-            # === features3: price as features ===
+            # === Factor 3: 24h price displacement ===
             current_price = dataframe['close'].iloc[current_idx]
             price_24h_ago = dataframe['close'].iloc[-96] if len(dataframe) >= 96 else dataframe['close'].iloc[0]
             price_change_24h = abs((current_price / price_24h_ago) - 1) if price_24h_ago > 0 else 0
             
-            # === features4: price ===
-            is_micro_price = current_price < 0.001  # small price（translatedmemefeatures）
+            # === Factor 4: nominal price level ===
+            is_micro_price = current_price < 0.001  # micro-priced assets are often more unstable
             is_low_price = current_price < 0.1      # low price
             
-            # === features5: indicator abnormal ===
+            # === Factor 5: extreme oscillator readings ===
             rsi = dataframe['rsi_14'].iloc[current_idx] if 'rsi_14' in dataframe.columns else 50
-            is_extreme_rsi = rsi > 80 or rsi < 20  # translatedRSIvalue
+            is_extreme_rsi = rsi > 80 or rsi < 20  # extreme RSI reading
             
-            # === features6: price ===
+            # === Factor 6: pump-like hourly price bursts ===
             recent_pumps = 0
             if len(dataframe) >= 24:
                 for i in range(1, min(24, len(dataframe))):
                     hour_change = (dataframe['close'].iloc[-i] / dataframe['close'].iloc[-i-1]) - 1
-                    if hour_change > 0.15:  # hours15%
+                    if hour_change > 0.15:  # >15% in one hour
                         recent_pumps += 1
             
-            # === score ===
+            # === Aggregate risk score ===
             risk_score = 0
             risk_factors = []
             
-            # volatility score (0-40translated)
+            # Volatility score (0-40)
             if volatility > 0.20:  # high volatility
                 risk_score += 40
                 risk_factors.append(f"high volatility({volatility*100:.1f}%)")
@@ -2055,73 +2295,76 @@ translatedReason: {reason}
                 risk_factors.append(f"high volatility({volatility*100:.1f}%)")
             elif volatility > 0.05:
                 risk_score += 10
-                risk_factors.append(f"mid({volatility*100:.1f}%)")
+                risk_factors.append(f"moderate volatility({volatility*100:.1f}%)")
             
-            # not score (0-25translated)
-            if volume_cv > 3:  # not
+            # Volume-instability score (0-25)
+            if volume_cv > 3:  # highly unstable volume
                 risk_score += 25
-                risk_factors.append(f"not(CV:{volume_cv:.1f})")
+                risk_factors.append(f"unstable volume(CV:{volume_cv:.1f})")
             elif volume_cv > 1.5:
                 risk_score += 15
-                risk_factors.append(f"not(CV:{volume_cv:.1f})")
+                risk_factors.append(f"elevated volume instability(CV:{volume_cv:.1f})")
             
-            # short-term price abnormal score (0-20translated)
+            # Short-term price dislocation score (0-20)
             if price_change_24h > 0.50:  # 24hours50%
                 risk_score += 20
-                risk_factors.append(f"24htranslated({price_change_24h*100:.1f}%)")
+                risk_factors.append(f"24h move({price_change_24h*100:.1f}%)")
             elif price_change_24h > 0.20:
                 risk_score += 10
-                risk_factors.append(f"24hlarge({price_change_24h*100:.1f}%)")
+                risk_factors.append(f"large 24h move({price_change_24h*100:.1f}%)")
             
-            # price score (0-10translated)
+            # Price-level score (0-10)
             if is_micro_price:
                 risk_score += 10
-                risk_factors.append(f"price(${current_price:.6f})")
+                risk_factors.append(f"micro price(${current_price:.6f})")
             elif is_low_price:
                 risk_score += 5
                 risk_factors.append(f"low price(${current_price:.3f})")
             
-            # Pumpas score (0-15translated)
+            # Pump-pattern score (0-15)
             if recent_pumps >= 3:
                 risk_score += 15
-                risk_factors.append(f"translatedpump({recent_pumps}times)")
+                risk_factors.append(f"repeated pumps({recent_pumps} times)")
             elif recent_pumps >= 1:
                 risk_score += 8
-                risk_factors.append(f"haspumpas({recent_pumps}times)")
+                risk_factors.append(f"recent pumps({recent_pumps} times)")
+
+            if is_extreme_rsi:
+                risk_factors.append(f"extreme RSI({rsi:.1f})")
             
-            # === risk level ===
+            # === Risk tier ===
             if risk_score >= 70:
-                risk_tier = 'high_risk'    # high risk（translated/memetranslated）
+                risk_tier = 'high_risk'    # aggressive risk profile
                 tier_name = "⚠️ high risk"
             elif risk_score >= 40:
                 risk_tier = 'medium_risk'  # medium risk
                 tier_name = "⚡ medium risk"
             else:
-                risk_tier = 'low_risk'     # low risk（translated）
+                risk_tier = 'low_risk'     # lower-risk profile
                 tier_name = "✅ low risk"
             
-            # day
+            # Diagnostic summary
             logger.info(f"""
-🎯 risk - {pair}:
-├─ risk level: {tier_name} (score: {risk_score}/100)
-├─ before price: ${current_price:.6f}
-├─ volatility: {volatility*100:.2f}% | 24htranslated: {price_change_24h*100:.1f}%
-├─ translatedCV: {volume_cv:.2f} | translatedPump: {recent_pumps}times
-├─ translated: {' | '.join(risk_factors) if risk_factors else 'features'}
-└─ translated: {'small position size to small large' if risk_tier == 'high_risk' else 'configuration' if risk_tier == 'low_risk' else 'translated'}
+🎯 Coin risk assessment - {pair}:
+├─ Risk tier: {tier_name} (score: {risk_score}/100)
+├─ Current price: ${current_price:.6f}
+├─ ATR volatility: {volatility*100:.2f}% | 24h move: {price_change_24h*100:.1f}%
+├─ Volume CV: {volume_cv:.2f} | Recent pumps: {recent_pumps} times
+├─ Factors: {' | '.join(risk_factors) if risk_factors else 'none'}
+└─ Guidance: {'use smaller size and tighter leverage' if risk_tier == 'high_risk' else 'standard risk controls are acceptable' if risk_tier == 'low_risk' else 'keep position sizing moderate'}
 """)
             
             return risk_tier
             
         except Exception as e:
-            logger.error(f"risk {pair}: {e}")
+            logger.error(f"Coin risk classification failed for {pair}: {e}")
             return 'medium_risk'  # medium risk
     
     def calculate_technical_health(self, dataframe: DataFrame) -> pd.Series:
-        """calculate"""
+        """Calculate an overall technical-health score."""
         health_components = {}
         
-        # 1. trend 1（count indicator）
+        # 1. Trend consistency across multiple indicators
         trend_signals = []
         if 'ema_21' in dataframe.columns:
             trend_signals.append((dataframe['close'] > dataframe['ema_21']).astype(int))
@@ -2135,18 +2378,18 @@ translatedReason: {reason}
         if trend_signals:
             health_components['trend_consistency'] = (sum(trend_signals) / len(trend_signals) - 0.5) * 2
         
-        # 2. volatility（not high not low）
+        # 2. Prefer moderate volatility over extremes
         if 'volatility_regime' in dataframe.columns:
-            vol_score = 1 - abs(dataframe['volatility_regime']) * 0.5  # mid most
+            vol_score = 1 - abs(dataframe['volatility_regime']) * 0.5  # neutral volatility scores highest
             health_components['volatility_health'] = vol_score
         
         # 3. volume confirmation
         if 'volume_ratio' in dataframe.columns:
             volume_health = ((dataframe['volume_ratio'] > 0.8).astype(float) * 0.5 + 
-                           (dataframe['volume_ratio'] < 2.0).astype(float) * 0.5)  # translated
+                           (dataframe['volume_ratio'] < 2.0).astype(float) * 0.5)  # avoid both weak and extreme volume
             health_components['volume_health'] = volume_health
         
-        # 4. indicator（translated/translated）
+        # 4. Penalize multi-indicator overbought or oversold extremes
         overbought_signals = []
         oversold_signals = []
         
@@ -2165,7 +2408,7 @@ translatedReason: {reason}
                                (sum(oversold_signals) >= 2).astype(int))
             health_components['balance_health'] = 1 - extreme_condition * 0.5
         
-        # score
+        # Weighted composite score
         weights = {
             'trend_consistency': 0.3, 'volatility_health': 0.25,
             'volume_health': 0.25, 'balance_health': 0.2
@@ -2179,10 +2422,10 @@ translatedReason: {reason}
         return technical_health.clip(-1, 1)
     
     def detect_market_state(self, dataframe: DataFrame) -> str:
-        """market state - translated"""
+        """Detect the current market state."""
         current_idx = -1
         
-        # get indicator
+        # Read core indicators
         adx = dataframe['adx'].iloc[current_idx]
         atr_p = dataframe['atr_p'].iloc[current_idx]
         rsi = dataframe['rsi_14'].iloc[current_idx]
@@ -2192,40 +2435,39 @@ translatedReason: {reason}
         ema_21 = dataframe['ema_21'].iloc[current_idx]
         ema_50 = dataframe['ema_50'].iloc[current_idx]
         
-        # getMACDindicator
+        # MACD values
         macd = dataframe['macd'].iloc[current_idx] if 'macd' in dataframe.columns else 0
         macd_signal = dataframe['macd_signal'].iloc[current_idx] if 'macd_signal' in dataframe.columns else 0
         
-        # === translated ===
-        # calculate high low
+        # === Price position within the recent range ===
         high_20 = dataframe['high'].rolling(20).max().iloc[current_idx]
         low_20 = dataframe['low'].rolling(20).min().iloc[current_idx]
         price_position = (price - low_20) / (high_20 - low_20) if high_20 > low_20 else 0.5
         
-        # at（avoid at）
+        # Potential local market top
         is_at_top = (
-            price_position > 0.90 and  # price at20day high
-            rsi > 70 and  # RSIoverbought
-            macd < macd_signal  # MACDtranslated
+            price_position > 0.90 and  # price near the 20-period high
+            rsi > 70 and  # RSI overbought
+            macd < macd_signal  # MACD momentum weakening
         )
         
-        # at（avoid at）
+        # Potential local market bottom
         is_at_bottom = (
-            price_position < 0.10 and  # price at20day low
-            rsi < 30 and  # RSIoversold
-            macd > macd_signal  # MACDtranslated
+            price_position < 0.10 and  # price near the 20-period low
+            rsi < 30 and  # RSI oversold
+            macd > macd_signal  # MACD momentum improving
         )
         
         # === trend strength analysis ===
-        # timeEMAtranslated
+        # EMA stack alignment
         ema_bullish = ema_8 > ema_21 > ema_50
         ema_bearish = ema_8 < ema_21 < ema_50
         
         # === market state ===
         if is_at_top:
-            return "market_top"  # translated，avoid
+            return "market_top"  # avoid fresh longs into exhaustion
         elif is_at_bottom:
-            return "market_bottom"  # translated，avoid
+            return "market_bottom"  # avoid fresh shorts into exhaustion
         elif adx > 40 and atr_p > self.volatility_threshold:
             if ema_bullish and not is_at_top:
                 return "strong_uptrend"
@@ -2246,23 +2488,23 @@ translatedReason: {reason}
             return "sideways"
     
     def calculate_var(self, returns: List[float], confidence_level: float = 0.05) -> float:
-        """calculateVaR (Value at Risk)"""
+        """Calculate Value at Risk (VaR)."""
         if len(returns) < 20:
-            return 0.05  # default5%risk
+            return 0.05  # default 5% risk
         
         returns_array = np.array(returns)
-        # use
+        # Historical percentile estimate
         var = np.percentile(returns_array, confidence_level * 100)
         return abs(var)
     
     def calculate_cvar(self, returns: List[float], confidence_level: float = 0.05) -> float:
-        """calculateCVaR (Conditional Value at Risk)"""
+        """Calculate Conditional Value at Risk (CVaR)."""
         if len(returns) < 20:
-            return 0.08  # default8%risk
+            return 0.08  # default 8% risk
         
         returns_array = np.array(returns)
         var = np.percentile(returns_array, confidence_level * 100)
-        # CVaRtranslatedVaRvalue
+        # CVaR is the average loss beyond the VaR threshold
         tail_losses = returns_array[returns_array <= var]
         if len(tail_losses) > 0:
             cvar = np.mean(tail_losses)
@@ -2270,7 +2512,7 @@ translatedReason: {reason}
         return abs(var)
     
     def calculate_portfolio_correlation(self, pair: str) -> float:
-        """calculate"""
+        """Calculate the average correlation of a pair against the rest of the portfolio."""
         if pair not in self.pair_returns_history:
             return 0.0
         
@@ -2278,12 +2520,12 @@ translatedReason: {reason}
         if len(current_returns) < 20:
             return 0.0
         
-        # calculate and
+        # Compare the pair with other tracked pairs
         correlations = []
         for other_pair, other_returns in self.pair_returns_history.items():
             if other_pair != pair and len(other_returns) >= 20:
                 try:
-                    # count long
+                    # Use the overlapping history window
                     min_length = min(len(current_returns), len(other_returns))
                     corr = np.corrcoef(
                         current_returns[-min_length:], 
@@ -2297,7 +2539,7 @@ translatedReason: {reason}
         return np.mean(correlations) if correlations else 0.0
     
     def calculate_kelly_fraction(self, pair: str) -> float:
-        """translatedKellycalculate"""
+        """Calculate a conservative Kelly fraction for the pair."""
         if pair not in self.pair_performance or self.trade_count < 20:
             return 0.25  # default value
         
@@ -2313,12 +2555,12 @@ translatedReason: {reason}
             avg_win = np.mean(wins)
             avg_loss = abs(np.mean(losses))
             
-            # Kellytranslated: f = (bp - q) / b
-            # mid b = avg_win/avg_loss, p = win_prob, q = 1-win_prob
+            # Kelly formula: f = (bp - q) / b
+            # where b = avg_win / avg_loss, p = win_prob, q = 1 - win_prob
             b = avg_win / avg_loss
             kelly = (b * win_prob - (1 - win_prob)) / b
             
-            # translated：useKellytranslated1/4to1/2
+            # Use a fractional Kelly approach for safety
             kelly_adjusted = max(0.05, min(0.4, kelly * 0.25))
             return kelly_adjusted
             
@@ -2326,7 +2568,7 @@ translatedReason: {reason}
             return 0.25
     
     def calculate_position_size(self, current_price: float, market_state: str, pair: str) -> float:
-        """position size - configuration market state + risk"""
+        """Calculate position size from market state and portfolio risk controls."""
         
         # === 🎯 get risk level ===
         try:
@@ -2336,49 +2578,49 @@ translatedReason: {reason}
             else:
                 coin_risk_tier = 'medium_risk'
         except Exception as e:
-            logger.warning(f"get risk level {pair}: {e}")
+            logger.warning(f"Failed to get coin risk tier for {pair}: {e}")
             coin_risk_tier = 'medium_risk'
         
-        # === risk（small position size to small large）===
+        # === Risk-tier position multipliers ===
         coin_risk_multipliers = {
-            'low_risk': 1.0,        # low risk：position size
-            'medium_risk': 0.8,     # medium risk：80%position size
-            'high_risk': 0.3        # high risk（translated）：30%position size，to small large
+            'low_risk': 1.0,        # standard position size
+            'medium_risk': 0.8,     # reduce to 80%
+            'high_risk': 0.3        # reduce to 30% for high-risk assets
         }
         coin_risk_multiplier = coin_risk_multipliers.get(coin_risk_tier, 0.8)
         
-        # === use configuration position size range mid value as ===
+        # === Use the midpoint of the configured position-size range ===
         base_position = (self.base_position_size + self.max_position_size) / 2
         
         # === winning streak/losing streak ===
         streak_multiplier = 1.0
         if self.consecutive_wins >= 5:
-            streak_multiplier = 1.5      # winning streak5times：position size1.5translated
+            streak_multiplier = 1.5
         elif self.consecutive_wins >= 3:
-            streak_multiplier = 1.3      # winning streak3times：position size1.3translated
+            streak_multiplier = 1.3
         elif self.consecutive_wins >= 1:
-            streak_multiplier = 1.1      # winning streak1times：position size1.1translated
+            streak_multiplier = 1.1
         elif self.consecutive_losses >= 3:
-            streak_multiplier = 0.6      # loss streak3times：position size to60%
+            streak_multiplier = 0.6
         elif self.consecutive_losses >= 1:
-            streak_multiplier = 0.8      # loss streak1times：position size to80%
+            streak_multiplier = 0.8
             
-        # === market state（simplified） ===
+        # === Market-state multiplier ===
         market_multipliers = {
-            "strong_uptrend": 1.25,      # strong trend：translated
-            "strong_downtrend": 1.25,    # strong trend：translated
+            "strong_uptrend": 1.25,
+            "strong_downtrend": 1.25,
             "mild_uptrend": 1.2,        # medium trend
             "mild_downtrend": 1.2,      # medium trend
-            "sideways": 1.0,            # translated：translated
-            "volatile": 0.8,            # high volatility：translated
-            "consolidation": 0.9        # translated：translated
+            "sideways": 1.0,
+            "volatile": 0.8,
+            "consolidation": 0.9
         }
         market_multiplier = market_multipliers.get(market_state, 1.0)
         
         # === time ===
         time_multiplier = self.get_time_session_position_boost()
         
-        # === translated ===
+        # === Equity-state multiplier ===
         equity_multiplier = 1.0
         if self.current_drawdown < -0.10:  # drawdown10%
             equity_multiplier = 0.6
@@ -2387,50 +2629,50 @@ translatedReason: {reason}
         elif self.current_drawdown == 0:     # none drawdown，profit
             equity_multiplier = 1.15
             
-        # === leverage ===
-        # get before leverage
+        # === Leverage-aware position scaling ===
+        # get the currently assigned leverage
         current_leverage = getattr(self, '_current_leverage', {}).get(pair, 20)
-        # leverage high，position size to low（as risk）
+        # reduce position size when leverage is already high
         leverage_adjustment = 1.0
         if current_leverage >= 75:
             leverage_adjustment = 0.8    # high leverage low position size
         elif current_leverage >= 50:
             leverage_adjustment = 0.9
         else:
-            leverage_adjustment = 1.1    # low leverage to high position size
+            leverage_adjustment = 1.1    # slightly larger size at lower leverage
             
-        # === 🚀translated（translated）===
+        # === Compound-growth accelerator ===
         compound_multiplier = self.get_compound_accelerator_multiplier()
             
-        # === 🎯 risk to ===
+        # === Total multiplier ===
         total_multiplier = (streak_multiplier * market_multiplier * 
                           time_multiplier * equity_multiplier * 
                           leverage_adjustment * compound_multiplier * 
-                          coin_risk_multiplier)  # new risk
+                          coin_risk_multiplier)
         
-        # risk level most large
+        # Cap the multiplier by risk tier
         max_multiplier_limits = {
-            'low_risk': 1.8,        # low risk：most1.8translated
-            'medium_risk': 1.5,     # medium risk：most1.5translated
-            'high_risk': 1.2        # high risk（translated）：most1.2translated，risk
+            'low_risk': 1.8,
+            'medium_risk': 1.5,
+            'high_risk': 1.2
         }
         max_multiplier = max_multiplier_limits.get(coin_risk_tier, 1.5)
         total_multiplier = min(total_multiplier, max_multiplier)
         
-        # === most position size calculate ===
+        # === Raw position-size calculation ===
         calculated_position = base_position * total_multiplier
         
-        # === position size（leverage）===
+        # === Position-size cap based on leverage ===
         if current_leverage >= 75:
-            max_allowed_position = 0.15  # high leverage most15%
+            max_allowed_position = 0.15
         elif current_leverage >= 50:
-            max_allowed_position = 0.20  # mid high leverage most20%
+            max_allowed_position = 0.20
         elif current_leverage >= 20:
-            max_allowed_position = 0.30  # mid leverage most30%
+            max_allowed_position = 0.30
         else:
-            max_allowed_position = self.max_position_size  # low leverage configuration up
+            max_allowed_position = self.max_position_size
         
-        # translated
+        # Keep size within a reasonable floor and cap
         final_position = max(self.base_position_size * 0.8, 
                            min(calculated_position, max_allowed_position))
         
@@ -2442,139 +2684,137 @@ translatedReason: {reason}
         }
         
         logger.info(f"""
-💰 position size calculate - {pair}:
-├─ 🔍 risk level: {risk_tier_names.get(coin_risk_tier, coin_risk_tier)}
-├─ 📊 position size: {base_position*100:.0f}%
-├─ 🏆 winning streak: {streak_multiplier:.1f}x (translated{self.consecutive_wins}/translated{self.consecutive_losses})
-├─ 📈 translated: {market_multiplier:.1f}x ({market_state})
-├─ ⏰ time: {time_multiplier:.1f}x
-├─ 💰 translated: {equity_multiplier:.1f}x
-├─ ⚖️ leverage adjustment: {leverage_adjustment:.1f}x ({current_leverage}xleverage)
-├─ 🚀 translated: {compound_multiplier:.1f}x
-├─ 🎯 risk adjustment: {coin_risk_multiplier:.1f}x ({coin_risk_tier})
-├─ 📐 translated: {max_multiplier:.1f}x (risk level)
-├─ 🧮 calculate position size: {calculated_position*100:.1f}%
-└─ 🎉 most position size: {final_position*100:.1f}%
+💰 Position size calculation - {pair}:
+├─ Risk tier: {risk_tier_names.get(coin_risk_tier, coin_risk_tier)}
+├─ Base position: {base_position*100:.0f}%
+├─ Streak multiplier: {streak_multiplier:.1f}x (wins: {self.consecutive_wins}, losses: {self.consecutive_losses})
+├─ Market multiplier: {market_multiplier:.1f}x ({market_state})
+├─ Time-session multiplier: {time_multiplier:.1f}x
+├─ Equity multiplier: {equity_multiplier:.1f}x
+├─ Leverage adjustment: {leverage_adjustment:.1f}x ({current_leverage}x leverage)
+├─ Compound multiplier: {compound_multiplier:.1f}x
+├─ Risk-tier adjustment: {coin_risk_multiplier:.1f}x ({coin_risk_tier})
+├─ Max multiplier cap: {max_multiplier:.1f}x
+├─ Raw position size: {calculated_position*100:.1f}%
+└─ Final position size: {final_position*100:.1f}%
 """)
         
         return final_position
     
     def get_time_session_position_boost(self) -> float:
-        """get time position size"""
+        """Return a time-of-day position-size multiplier."""
         current_time = datetime.now(timezone.utc)
         hour = current_time.hour
         
-        # position adjustment
-        if 14 <= hour <= 16:       # translated：most
+        # Session-based position adjustments
+        if 14 <= hour <= 16:       # strongest session
             return 1.2
-        elif 8 <= hour <= 10:      # translated：translated  
+        elif 8 <= hour <= 10:      # active session
             return 1.1
-        elif 0 <= hour <= 2:       # translated：mid
+        elif 0 <= hour <= 2:       # neutral session
             return 1.0
-        elif 3 <= hour <= 7:       # translated：low
+        elif 3 <= hour <= 7:       # quieter session
             return 0.9
         else:
             return 1.0
     
     def get_compound_accelerator_multiplier(self) -> float:
-        """🚀translated - day position size"""
+        """Return a position-size multiplier based on recent daily performance."""
         
-        # get day
+        # Estimated daily performance
         daily_profit = self.get_daily_profit_percentage()
         
-        # translated
+        # Base accelerator mode
         if daily_profit >= 0.20:      # day > 20%
-            multiplier = 1.5          # times day position size1.5translated（translated）
-            mode = "🚀translated"
+            multiplier = 1.5
+            mode = "rocket"
         elif daily_profit >= 0.10:    # day 10-20%
-            multiplier = 1.5          # times day position size1.5translated
-            mode = "⚡high"
+            multiplier = 1.5
+            mode = "high_gain"
         elif daily_profit >= 0.05:    # day 5-10%
-            multiplier = 1.2          # times day position size1.2translated
-            mode = "📈translated"
+            multiplier = 1.2
+            mode = "positive"
         elif daily_profit >= 0:       # day 0-5%
-            multiplier = 1.0          # position size
-            mode = "📊translated"
+            multiplier = 1.0
+            mode = "neutral"
         elif daily_profit >= -0.05:   # day loss 0-5%
-            multiplier = 0.8          # translated
-            mode = "🔄translated"
+            multiplier = 0.8
+            mode = "cooldown"
         else:                         # day loss > 5%
-            multiplier = 0.5          # times day position size（translated）
-            mode = "❄️translated"
+            multiplier = 0.5
+            mode = "defensive"
             
-        # profit day
+        # Boost after multiple profitable days
         consecutive_profit_days = self.get_consecutive_profit_days()
         if consecutive_profit_days >= 3:
-            multiplier *= min(1.3, 1 + consecutive_profit_days * 0.05)  # most high30%translated
+            multiplier *= min(1.3, 1 + consecutive_profit_days * 0.05)  # cap the boost at +30%
             
-        # loss day
+        # Reduce after multiple losing days
         consecutive_loss_days = self.get_consecutive_loss_days()
         if consecutive_loss_days >= 2:
-            multiplier *= max(0.3, 1 - consecutive_loss_days * 0.15)   # most low30%
+            multiplier *= max(0.3, 1 - consecutive_loss_days * 0.15)   # floor at 30%
             
-        # translated：0.3x - 2.5x
+        # Final safety bounds: 0.3x - 2.5x
         final_multiplier = max(0.3, min(multiplier, 2.5))
         
         logger.info(f"""
-🚀 translated:
-├─ day: {daily_profit*100:+.2f}%
-├─ translated: {mode}
-├─ translated: {multiplier:.2f}x
-├─ profit: {consecutive_profit_days}translated
-├─ loss: {consecutive_loss_days}translated
-└─ most: {final_multiplier:.2f}x
+🚀 Compound accelerator:
+├─ Daily profit estimate: {daily_profit*100:+.2f}%
+├─ Mode: {mode}
+├─ Raw multiplier: {multiplier:.2f}x
+├─ Consecutive profit days: {consecutive_profit_days}
+├─ Consecutive loss days: {consecutive_loss_days}
+└─ Final multiplier: {final_multiplier:.2f}x
 """)
         
         return final_multiplier
     
     def get_daily_profit_percentage(self) -> float:
-        """get day"""
+        """Return an estimated daily profit percentage."""
         try:
-            # simplified version：before
+            # Simplified placeholder based on total profit
             if hasattr(self, 'total_profit'):
-                # to day calculate
-                # use value
-                return self.total_profit * 0.1  # day10%
+                return self.total_profit * 0.1  # approximate day-level PnL
             else:
                 return 0.0
         except Exception:
             return 0.0
     
     def get_consecutive_profit_days(self) -> int:
-        """get profit"""
+        """Return an approximate count of consecutive profit days."""
         try:
-            # simplified，to after optimize as day
+            # Simplified approximation from win streaks
             if self.consecutive_wins >= 5:
-                return min(7, self.consecutive_wins // 2)  # as large
+                return min(7, self.consecutive_wins // 2)
             else:
                 return 0
         except Exception:
             return 0
     
     def get_consecutive_loss_days(self) -> int:
-        """get loss"""
+        """Return an approximate count of consecutive loss days."""
         try:
-            # simplified，to after optimize as day
+            # Simplified approximation from loss streaks
             if self.consecutive_losses >= 3:
-                return min(5, self.consecutive_losses // 1)  # as large
+                return min(5, self.consecutive_losses // 1)
             else:
                 return 0
         except Exception:
             return 0
     
     def update_portfolio_performance(self, pair: str, return_pct: float):
-        """update record"""
-        # update
+        """Update stored performance history for the pair."""
+        # Update return history
         if pair not in self.pair_returns_history:
             self.pair_returns_history[pair] = []
         
         self.pair_returns_history[pair].append(return_pct)
         
-        # most500count record
+        # Keep at most 500 return samples
         if len(self.pair_returns_history[pair]) > 500:
             self.pair_returns_history[pair] = self.pair_returns_history[pair][-500:]
         
-        # update record
+        # Update pair-level trade performance history
         if pair not in self.pair_performance:
             self.pair_performance[pair] = []
         
@@ -2582,17 +2822,17 @@ translatedReason: {reason}
         if len(self.pair_performance[pair]) > 200:
             self.pair_performance[pair] = self.pair_performance[pair][-200:]
         
-        # update
+        # Refresh the correlation matrix
         self.update_correlation_matrix()
     
     def update_correlation_matrix(self):
-        """update"""
+        """Update the internal correlation matrix for tracked pairs."""
         try:
             pairs = list(self.pair_returns_history.keys())
             if len(pairs) < 2:
                 return
             
-            # translated
+            # Initialize the square correlation matrix
             n = len(pairs)
             correlation_matrix = np.zeros((n, n))
             
@@ -2621,7 +2861,7 @@ translatedReason: {reason}
             pass
     
     def get_portfolio_risk_metrics(self) -> Dict[str, float]:
-        """calculate risk indicator"""
+        """Calculate aggregate portfolio risk metrics."""
         try:
             total_var = 0.0
             total_cvar = 0.0
@@ -2638,7 +2878,7 @@ translatedReason: {reason}
                     'diversification_ratio': 1.0
                 }
             
-            # calculateVaRtranslatedCVaR
+            # Aggregate VaR and CVaR across active pairs
             var_values = []
             cvar_values = []
             
@@ -2650,18 +2890,18 @@ translatedReason: {reason}
             total_var = np.mean(var_values)
             total_cvar = np.mean(cvar_values)
             
-            # calculate
+            # Estimate average pairwise correlation
             correlations = []
             for i, pair1 in enumerate(active_pairs):
                 for j, pair2 in enumerate(active_pairs):
-                    if i < j:  # avoid calculate
+                    if i < j:  # avoid duplicate pair calculations
                         corr = self.calculate_portfolio_correlation(pair1)
                         if corr > 0:
                             correlations.append(corr)
             
             portfolio_correlation = np.mean(correlations) if correlations else 0.0
             
-            # translated
+            # Higher values imply better diversification
             diversification_ratio = len(active_pairs) * (1 - portfolio_correlation)
             
             return {
@@ -2680,9 +2920,9 @@ translatedReason: {reason}
             }
     
     def calculate_leverage(self, market_state: str, volatility: float, pair: str, current_time: datetime = None) -> int:
-        """🚀leverage - volatility calculate + risk"""
+        """Calculate leverage from volatility, market state, and risk controls."""
         
-        # === 🎯 get risk level（translated） ===
+        # === Determine the pair risk tier ===
         try:
             dataframe = self.get_dataframe_with_indicators(pair, self.timeframe)
             if not dataframe.empty:
@@ -2690,23 +2930,23 @@ translatedReason: {reason}
             else:
                 coin_risk_tier = 'medium_risk'  # default medium risk
         except Exception as e:
-            logger.warning(f"get risk level {pair}: {e}")
+            logger.warning(f"Failed to get coin risk tier for {pair}: {e}")
             coin_risk_tier = 'medium_risk'
         
         # === risk leverage ===
         coin_leverage_limits = {
-            'low_risk': (10, 100),      # low risk：10-100translated（not）
-            'medium_risk': (5, 50),     # medium risk：5-50translated
-            'high_risk': (1, 10)        # high risk（translated）：1-10translated（translated）
+            'low_risk': (10, 100),      # wider leverage range
+            'medium_risk': (5, 50),     # moderate leverage range
+            'high_risk': (1, 10)        # tightly capped leverage
         }
         
         # get before leverage
         min_allowed, max_allowed = coin_leverage_limits.get(coin_risk_tier, (5, 50))
         
-        # === translated：volatility leverage ===
-        volatility_percent = volatility * 100  # as
+        # === Map volatility to a base leverage ===
+        volatility_percent = volatility * 100
         
-        # leverage（volatility）
+        # Lower volatility allows higher base leverage
         if volatility_percent < 0.5:
             base_leverage = 100  # low volatility = high leverage
         elif volatility_percent < 1.0:
@@ -2718,25 +2958,25 @@ translatedReason: {reason}
         elif volatility_percent < 2.5:
             base_leverage = 20   # mid high volatility
         else:
-            base_leverage = 10   # high volatility，leverage
+            base_leverage = 10   # high volatility
             
         # === winning streak/losing streak ===
         streak_multiplier = 1.0
         if self.consecutive_wins >= 5:
             streak_multiplier = 2.0      # winning streak5times：leverage
         elif self.consecutive_wins >= 3:
-            streak_multiplier = 1.5      # winning streak3times：leverage1.5translated
+            streak_multiplier = 1.5
         elif self.consecutive_wins >= 1:
-            streak_multiplier = 1.2      # winning streak1times：leverage1.2translated
+            streak_multiplier = 1.2
         elif self.consecutive_losses >= 3:
             streak_multiplier = 0.5      # loss streak3times：leverage
         elif self.consecutive_losses >= 1:
-            streak_multiplier = 0.8      # loss streak1times：leverage8translated
+            streak_multiplier = 0.8
             
         # === time optimize ===
         time_multiplier = self.get_time_session_leverage_boost(current_time)
         
-        # === market state（simplified） ===
+        # === Market-state multiplier ===
         market_multipliers = {
             "strong_uptrend": 1.3,
             "strong_downtrend": 1.3,
@@ -2748,7 +2988,7 @@ translatedReason: {reason}
         }
         market_multiplier = market_multipliers.get(market_state, 1.0)
         
-        # === translated ===
+        # === Equity-state multiplier ===
         equity_multiplier = 1.0
         if self.current_drawdown < -0.05:  # drawdown5%
             equity_multiplier = 0.7
@@ -2757,21 +2997,20 @@ translatedReason: {reason}
         elif self.current_drawdown == 0:     # none drawdown
             equity_multiplier = 1.2
             
-        # === most leverage calculate ===
+        # === Raw leverage calculation ===
         calculated_leverage = base_leverage * streak_multiplier * time_multiplier * market_multiplier * equity_multiplier
         
-        # original：10-100translated
+        # Clamp to the global leverage window first
         pre_risk_leverage = max(10, min(int(calculated_leverage), 100))
         
-        # === 🎯 risk leverage（translated） ===
+        # Apply pair-specific leverage limits
         final_leverage = max(min_allowed, min(pre_risk_leverage, max_allowed))
         
-        # === translated ===
-        # day loss3%，low leverage
+        # Reduce leverage further after significant daily losses
         if hasattr(self, 'daily_loss') and self.daily_loss < -0.03:
             final_leverage = min(final_leverage, 20)
             
-        # loss
+        # Reduce leverage after persistent losses
         if self.consecutive_losses >= 5:
             final_leverage = min(final_leverage, 15)
             
@@ -2783,48 +3022,48 @@ translatedReason: {reason}
         }
         
         logger.info(f"""
-⚡ leverage calculate - {pair}:
-├─ 🔍 risk level: {risk_tier_names.get(coin_risk_tier, coin_risk_tier)}
-├─ 🎯 risk: {min_allowed}-{max_allowed}translated
-├─ 📊 volatility: {volatility_percent:.2f}% → leverage: {base_leverage}x
-├─ 🏆 winning streak: {self.consecutive_wins}translated{self.consecutive_losses}translated → translated: {streak_multiplier:.1f}x
-├─ ⏰ time: {time_multiplier:.1f}x
-├─ 📈 translated: {market_multiplier:.1f}x  
-├─ 💰 translated: {equity_multiplier:.1f}x
-├─ 🧮 calculate leverage: {calculated_leverage:.1f}x
-├─ 🔒 leverage: {pre_risk_leverage}x (translated: 10-100x)
-└─ 🎉 most leverage: {final_leverage}x ({coin_risk_tier}translated: {min_allowed}-{max_allowed}x)
+⚡ Leverage calculation - {pair}:
+├─ Risk tier: {risk_tier_names.get(coin_risk_tier, coin_risk_tier)}
+├─ Allowed leverage range: {min_allowed}-{max_allowed}x
+├─ Volatility: {volatility_percent:.2f}% → base leverage: {base_leverage}x
+├─ Streak multiplier: {streak_multiplier:.1f}x (wins: {self.consecutive_wins}, losses: {self.consecutive_losses})
+├─ Time-session multiplier: {time_multiplier:.1f}x
+├─ Market multiplier: {market_multiplier:.1f}x
+├─ Equity multiplier: {equity_multiplier:.1f}x
+├─ Raw leverage: {calculated_leverage:.1f}x
+├─ Globally clamped leverage: {pre_risk_leverage}x (range: 10-100x)
+└─ Final leverage: {final_leverage}x ({coin_risk_tier}: {min_allowed}-{max_allowed}x)
 """)
         
         return final_leverage
     
     def get_time_session_leverage_boost(self, current_time: datetime = None) -> float:
-        """get time leverage"""
+        """Return a time-of-day leverage multiplier."""
         if not current_time:
             current_time = datetime.now(timezone.utc)
             
         hour = current_time.hour
         
-        # leverage optimize
-        if 0 <= hour <= 2:      # translated 00:00-02:00
+        # Session-based leverage adjustments
+        if 0 <= hour <= 2:      # early UTC session
             return 1.2
-        elif 8 <= hour <= 10:   # translated 08:00-10:00
+        elif 8 <= hour <= 10:   # active session
             return 1.3
-        elif 14 <= hour <= 16:  # translated 14:00-16:00
-            return 1.5          # most high
-        elif 20 <= hour <= 22:  # translated 20:00-22:00
+        elif 14 <= hour <= 16:  # strongest session
+            return 1.5
+        elif 20 <= hour <= 22:  # evening session
             return 1.2
-        elif 3 <= hour <= 7:    # translated 03:00-07:00
-            return 0.8          # low leverage
-        elif 11 <= hour <= 13:  # translated 11:00-13:00
+        elif 3 <= hour <= 7:    # quieter session
+            return 0.8
+        elif 11 <= hour <= 13:  # middling session
             return 0.9
         else:
-            return 1.0          # translated
+            return 1.0
     
-    # translated calculate_dynamic_stoploss - use
+    # Dynamic stoploss helper removed in the current implementation
     
     def calculate_dynamic_takeprofit(self, pair: str, current_rate: float, trade: Trade, current_profit: float) -> Optional[float]:
-        """calculate price"""
+        """Calculate an adaptive take-profit target price."""
         try:
             dataframe = self.get_dataframe_with_indicators(pair, self.timeframe)
             if dataframe.empty:
@@ -2836,78 +3075,78 @@ translatedReason: {reason}
             trend_strength = current_data.get('trend_strength', 50)
             momentum_score = current_data.get('momentum_score', 0)
             
-            # translatedATRtranslated
-            base_profit_multiplier = 2.5  # ATRtranslated2.5translated
+            # Base profit distance in ATR terms
+            base_profit_multiplier = 2.5  # 2.5x ATR baseline
             
-            # trend strength
+            # Trend-strength adjustment
             if abs(trend_strength) > 70:  # strong trend
                 trend_multiplier = 1.5
             elif abs(trend_strength) > 40:  # medium trend
                 trend_multiplier = 1.2
-            else:  # trend
+            else:  # weak or neutral trend
                 trend_multiplier = 1.0
             
-            # momentum
+            # Momentum adjustment
             momentum_multiplier = 1.0
             if abs(momentum_score) > 0.3:
                 momentum_multiplier = 1.3
             elif abs(momentum_score) > 0.1:
                 momentum_multiplier = 1.1
             
-            # translated
+            # Combined multiplier
             profit_multiplier = base_profit_multiplier * trend_multiplier * momentum_multiplier
             
-            # calculate
+            # Distance from entry expressed as a price fraction
             profit_distance = current_atr * profit_multiplier
             
             # range：8%-80%
             profit_distance = max(0.08, min(0.80, profit_distance))
             
-            # calculate price
+            # Convert the target distance into an absolute target price
             if trade.is_short:
                 target_price = trade.open_rate * (1 - profit_distance)
             else:
                 target_price = trade.open_rate * (1 + profit_distance)
             
             logger.info(f"""
-🎯 calculate - {pair}:
-├─ price: ${trade.open_rate:.6f}
-├─ before price: ${current_rate:.6f}
-├─ before: {current_profit:.2%}
-├─ ATRtranslated: {profit_multiplier:.2f}
-├─ translated: {profit_distance:.2%}
-├─ price: ${target_price:.6f}
-└─ translated: {'bearish' if trade.is_short else 'bullish'}
+🎯 Dynamic take-profit - {pair}:
+├─ Entry price: ${trade.open_rate:.6f}
+├─ Current price: ${current_rate:.6f}
+├─ Current profit: {current_profit:.2%}
+├─ Profit multiplier: {profit_multiplier:.2f}x ATR
+├─ Profit distance: {profit_distance:.2%}
+├─ Target price: ${target_price:.6f}
+└─ Direction: {'short' if trade.is_short else 'long'}
 """)
             
             return target_price
             
         except Exception as e:
-            logger.error(f"calculate {pair}: {e}")
+            logger.error(f"Dynamic take-profit calculation failed for {pair}: {e}")
             return None
     
-    # translated get_smart_trailing_stop - simplified
+    # Smart trailing-stop helper removed in the current implementation
     
     def validate_and_calibrate_indicators(self, dataframe: DataFrame) -> DataFrame:
-        """indicator"""
+        """Validate and lightly smooth key indicators."""
         try:
-            logger.info(f"indicator validation and calibration，translated: {len(dataframe)}")
+            logger.info(f"Validating and calibrating indicators for {len(dataframe)} rows")
             
             # === RSI indicator ===
             if 'rsi_14' in dataframe.columns:
-                # translatedRSIabnormal value value
+                # Clamp RSI to a valid range and fill missing values
                 original_rsi_nulls = dataframe['rsi_14'].isnull().sum()
                 dataframe['rsi_14'] = dataframe['rsi_14'].clip(0, 100)
                 dataframe['rsi_14'] = dataframe['rsi_14'].fillna(50)
                 
-                # RSItranslated（translated）
+                # Light RSI smoothing
                 dataframe['rsi_14'] = dataframe['rsi_14'].ewm(span=2).mean()
                 
-                logger.info(f"RSItranslated - original value: {original_rsi_nulls}, range: 0-100")
+                logger.info(f"RSI validated - original null count: {original_rsi_nulls}, clipped to 0-100")
             
             # === MACD indicator ===
             if 'macd' in dataframe.columns:
-                # MACDindicator
+                # Fill missing values and lightly smooth MACD
                 original_macd_nulls = dataframe['macd'].isnull().sum()
                 dataframe['macd'] = dataframe['macd'].fillna(0)
                 dataframe['macd'] = dataframe['macd'].ewm(span=3).mean()
@@ -2916,15 +3155,15 @@ translatedReason: {reason}
                     dataframe['macd_signal'] = dataframe['macd_signal'].fillna(0)
                     dataframe['macd_signal'] = dataframe['macd_signal'].ewm(span=3).mean()
                 
-                logger.info(f"MACDtranslated - original value: {original_macd_nulls}, translated3translated")
+                logger.info(f"MACD validated - original null count: {original_macd_nulls}, smoothed with span=3")
             
             # === ATR indicator ===
             if 'atr_p' in dataframe.columns:
-                # ATRabnormal value
+                # Detect and clip ATR outliers
                 atr_median = dataframe['atr_p'].median()
                 atr_std = dataframe['atr_p'].std()
                 
-                # translatedATRat range（mid ± 5translated）
+                # Keep ATR within a wide median +/- 5 std envelope
                 lower_bound = max(0.001, atr_median - 5 * atr_std)
                 upper_bound = min(0.5, atr_median + 5 * atr_std)
                 
@@ -2934,13 +3173,13 @@ translatedReason: {reason}
                 dataframe['atr_p'] = dataframe['atr_p'].clip(lower_bound, upper_bound)
                 dataframe['atr_p'] = dataframe['atr_p'].fillna(atr_median)
                 
-                logger.info(f"ATRtranslated - abnormal value: {original_atr_outliers}, range: {lower_bound:.4f}-{upper_bound:.4f}")
+                logger.info(f"ATR validated - outliers clipped: {original_atr_outliers}, range: {lower_bound:.4f}-{upper_bound:.4f}")
             
             # === ADX indicator ===
             if 'adx' in dataframe.columns:
                 dataframe['adx'] = dataframe['adx'].clip(0, 100)
-                dataframe['adx'] = dataframe['adx'].fillna(25)  # ADXdefault value25
-                logger.info("ADXtranslated - range: 0-100, default value: 25")
+                dataframe['adx'] = dataframe['adx'].fillna(25)  # ADX default
+                logger.info("ADX validated - range: 0-100, default: 25")
             
             # === volume ===
             if 'volume_ratio' in dataframe.columns:
@@ -2962,23 +3201,23 @@ translatedReason: {reason}
                 logger.info("momentum score - range: -3to3, default value: 0")
             
             # === EMA indicator ===
-            # translatedEMAindicator not，original calculate
+            # Forward/backfill EMA gaps and recalculate extreme outliers if needed
             for ema_col in ['ema_8', 'ema_21', 'ema_50']:
                 if ema_col in dataframe.columns:
-                    # abnormal value value，not
+                    # Fill missing values
                     null_count = dataframe[ema_col].isnull().sum()
                     if null_count > 0:
-                        # use before value
+                        # Fill from nearby values
                         dataframe[ema_col] = dataframe[ema_col].ffill().bfill()
-                        logger.info(f"{ema_col} value - original value: {null_count}")
+                        logger.info(f"{ema_col} filled missing values: {null_count}")
                     
-                    # check has abnormalEMAvalue（price10to up）
+                    # Recalculate EMA if it becomes wildly detached from price
                     if 'close' in dataframe.columns:
                         price_ratio = dataframe[ema_col] / dataframe['close']
                         outliers = ((price_ratio > 10) | (price_ratio < 0.1)).sum()
                         if outliers > 0:
-                            logger.warning(f"{ema_col} translated {outliers} count abnormal value，recalculate")
-                            # recalculateEMA
+                            logger.warning(f"{ema_col} has {outliers} extreme values relative to price, recalculating")
+                            # Recalculate the affected EMA
                             if ema_col == 'ema_8':
                                 dataframe[ema_col] = ta.EMA(dataframe, timeperiod=8)
                             elif ema_col == 'ema_21':
@@ -2996,11 +3235,11 @@ translatedReason: {reason}
             return dataframe
     
     def _log_indicator_health(self, dataframe: DataFrame):
-        """record indicator day"""
+        """Log a compact health summary for the core indicators."""
         try:
             health_report = []
             
-            # check count indicator
+            # Core indicators to monitor
             indicators_to_check = ['rsi_14', 'macd', 'atr_p', 'adx', 'volume_ratio', 'trend_strength', 'momentum_score', 'ema_8', 'ema_21', 'ema_50']
             
             for indicator in indicators_to_check:
@@ -3010,24 +3249,29 @@ translatedReason: {reason}
                         null_count = dataframe[indicator].isnull().sum()
                         null_pct = null_count / len(dataframe) * 100
                         
-                        health_status = "translated" if null_pct < 5 else "translated" if null_pct < 15 else "translated"
+                        health_status = "healthy" if null_pct < 5 else "warning" if null_pct < 15 else "critical"
                         
-                        health_report.append(f"├─ {indicator}: {health_status} (value: {null_pct:.1f}%)")
+                        health_report.append(f"├─ {indicator}: {health_status} (nulls: {null_pct:.1f}%)")
             
             if health_report:
+                overall_status = (
+                    "healthy" if all("healthy" in line for line in health_report)
+                    else "warning" if any("warning" in line for line in health_report)
+                    else "critical"
+                )
                 logger.info(f"""
-📊 indicator:
+📊 Indicator health:
 {chr(10).join(health_report)}
-└─ translated: {'translated' if all('translated' in line for line in health_report) else 'translated' if any('translated' in line for line in health_report) else 'translated'}
+└─ Overall status: {overall_status}
 """)
         except Exception as e:
-            logger.error(f"indicator check: {e}")
+            logger.error(f"Indicator health logging failed: {e}")
     
     def validate_real_data_quality(self, dataframe: DataFrame, pair: str) -> bool:
-        """as"""
+        """Validate that the dataframe contains plausible market data."""
         try:
             if len(dataframe) < 10:
-                logger.warning(f"not {pair}: {len(dataframe)} translated")
+                logger.warning(f"Insufficient data for {pair}: only {len(dataframe)} rows")
                 return False
             
             # check price
@@ -3038,7 +3282,7 @@ translatedReason: {reason}
                         logger.error(f"price as value {pair}: {col}")
                         return False
                     
-                    # check price has
+                    # Warn if the price barely changes across the sample
                     price_std = dataframe[col].std()
                     price_mean = dataframe[col].mean()
                     if price_std / price_mean < 0.001:  # low0.1%
@@ -3047,7 +3291,7 @@ translatedReason: {reason}
             # check volume
             if 'volume' in dataframe.columns:
                 if dataframe['volume'].sum() == 0:
-                    logger.warning(f"volume as0 {pair}")
+                    logger.warning(f"Volume is zero for {pair}")
                 else:
                     # check volume has
                     volume_std = dataframe['volume'].std()
@@ -3059,47 +3303,47 @@ translatedReason: {reason}
             if 'date' in dataframe.columns or dataframe.index.name == 'date':
                 time_diff = dataframe.index.to_series().diff().dropna()
                 if len(time_diff) > 0:
-                    # calculate time，use most time as value
+                    # Use the most common interval as the expected spacing
                     expected_interval = time_diff.mode().iloc[0] if len(time_diff.mode()) > 0 else pd.Timedelta(minutes=5)
                     abnormal_intervals = (time_diff != expected_interval).sum()
-                    if abnormal_intervals > len(time_diff) * 0.1:  # translated10%time abnormal
-                        logger.warning(f"time abnormal {pair}: {abnormal_intervals}/{len(time_diff)} count abnormal (translated: {expected_interval})")
+                    if abnormal_intervals > len(time_diff) * 0.1:  # more than 10% abnormal intervals
+                        logger.warning(f"Time spacing anomalies for {pair}: {abnormal_intervals}/{len(time_diff)} intervals differ from expected {expected_interval}")
             
-            logger.info(f"✅ translated {pair}: {len(dataframe)} has")
+            logger.info(f"✅ Data quality passed for {pair}: {len(dataframe)} rows checked")
             return True
             
         except Exception as e:
-            logger.error(f"translated {pair}: {e}")
+            logger.error(f"Data quality validation failed for {pair}: {e}")
             return False
     
-    # translated _log_detailed_exit_decision translated - simplified day
+    # `_log_detailed_exit_decision` removed in this simplified version
     
     def _log_risk_calculation_details(self, pair: str, input_params: dict, result: dict):
-        """record risk calculate"""
+        """Log risk-calculation details."""
         try:
-            # day record
+            # Reserved for a more detailed risk decision logger
             pass
         except Exception as e:
-            logger.error(f"risk calculate day record {pair}: {e}")
+            logger.error(f"Risk-calculation logging failed for {pair}: {e}")
     
     def _calculate_risk_rating(self, risk_percentage: float) -> str:
-        """calculate risk level"""
+        """Map a numeric risk percentage to a qualitative label."""
         try:
             if risk_percentage < 0.01:  # small1%
                 return "low risk"
             elif risk_percentage < 0.02:  # 1-2%
-                return "mid low risk"
+                return "moderately low risk"
             elif risk_percentage < 0.03:  # 2-3%
                 return "medium risk"
             elif risk_percentage < 0.05:  # 3-5%
-                return "mid high risk"
+                return "moderately high risk"
             else:  # large5%
                 return "high risk"
         except Exception:
-            return "risk"
+            return "unknown risk"
     
     def get_equity_performance_factor(self) -> float:
-        """get"""
+        """Return a multiplier based on equity growth or drawdown."""
         if self.initial_balance is None:
             return 1.0
             
@@ -3109,20 +3353,20 @@ translatedReason: {reason}
             if current_balance <= 0:
                 return 0.5
                 
-            # calculate
+            # Portfolio return since initialization
             returns = (current_balance - self.initial_balance) / self.initial_balance
             
-            # update value
+            # Update peak balance and drawdown tracking
             if self.peak_balance is None or current_balance > self.peak_balance:
                 self.peak_balance = current_balance
                 self.current_drawdown = 0
             else:
                 self.current_drawdown = (self.peak_balance - current_balance) / self.peak_balance
             
-            # drawdown calculate weight
-            if returns > 0.5:  # translated50%
+            # Convert equity performance into a multiplier
+            if returns > 0.5:  # above 50%
                 return 1.5
-            elif returns > 0.2:  # translated20-50%
+            elif returns > 0.2:  # 20% to 50%
                 return 1.3
             elif returns > 0:
                 return 1.1
@@ -3137,42 +3381,42 @@ translatedReason: {reason}
             return 1.0
     
     def get_streak_factor(self) -> float:
-        """get winning streak losing streak"""
+        """Return a multiplier based on recent win/loss streaks."""
         if self.consecutive_wins >= 5:
-            return 1.4  # winning streak5times to up，leverage
+            return 1.4
         elif self.consecutive_wins >= 3:
             return 1.2  # winning streak3-4times
         elif self.consecutive_wins >= 1:
             return 1.1  # winning streak1-2times
         elif self.consecutive_losses >= 5:
-            return 0.4  # losing streak5times to up，large low leverage
+            return 0.4
         elif self.consecutive_losses >= 3:
             return 0.6  # losing streak3-4times
         elif self.consecutive_losses >= 1:
             return 0.8  # losing streak1-2times
         else:
-            return 1.0  # has winning streak losing streak record
+            return 1.0
     
     def get_time_session_factor(self, current_time: datetime) -> float:
-        """get weight"""
+        """Return a session-based weighting factor."""
         if current_time is None:
             return 1.0
             
-        # getUTCtime hours
+        # UTC hour
         hour_utc = current_time.hour
         
-        # weight
-        if 8 <= hour_utc <= 16:  # translated (translated)
+        # Session weights
+        if 8 <= hour_utc <= 16:  # active session
             return 1.3
-        elif 13 <= hour_utc <= 21:  # translated (most)
+        elif 13 <= hour_utc <= 21:  # peak session overlap
             return 1.5
-        elif 22 <= hour_utc <= 6:  # translated (translated)
+        elif 22 <= hour_utc <= 6:  # quieter session
             return 0.8
-        else:  # translated
+        else:
             return 1.0
     
     def get_position_diversity_factor(self) -> float:
-        """get"""
+        """Return a multiplier based on the number of open trades."""
         try:
             open_trades = Trade.get_open_trades()
             open_count = len(open_trades)
@@ -3180,13 +3424,13 @@ translatedReason: {reason}
             if open_count == 0:
                 return 1.0
             elif open_count <= 2:
-                return 1.2  # translated，leverage
+                return 1.2
             elif open_count <= 5:
                 return 1.0  # mid
             elif open_count <= 8:
-                return 0.8  # translated，low leverage
+                return 0.8
             else:
-                return 0.6  # translated，large low
+                return 0.6
                 
         except Exception:
             return 1.0
@@ -3215,7 +3459,7 @@ translatedReason: {reason}
         
         return avg_win / avg_loss if avg_loss > 0 else 1.5
     
-    # translated analyze_multi_timeframe - simplified
+    # Simplified single-timeframe analysis kept under the old MTF interface
     def analyze_multi_timeframe(self, dataframe: DataFrame, metadata: dict) -> Dict:
         """Simplified single timeframe analysis - removed multi-timeframe complexity"""
         
@@ -3267,7 +3511,7 @@ translatedReason: {reason}
         }
     
     def get_dataframe_with_indicators(self, pair: str, timeframe: str = None) -> DataFrame:
-        """get indicatordataframe"""
+        """Fetch a pair dataframe and ensure key indicators are populated."""
         if timeframe is None:
             timeframe = self.timeframe
             
@@ -3282,18 +3526,18 @@ translatedReason: {reason}
             missing_indicators = [indicator for indicator in required_indicators if indicator not in dataframe.columns]
             
             if missing_indicators:
-                # recalculate indicator
+                # Recalculate indicators if they are missing
                 metadata = {'pair': pair}
                 dataframe = self.populate_indicators(dataframe, metadata)
                 
             return dataframe
             
         except Exception as e:
-            logger.error(f"get indicator {pair}: {e}")
+            logger.error(f"Failed to get indicator dataframe for {pair}: {e}")
             return DataFrame()
 
     def _safe_series(self, data, length: int, fill_value=0) -> pd.Series:
-        """translatedSeries，avoid"""
+        """Return a series of the requested length, falling back to a fill value when needed."""
         if isinstance(data, (int, float)):
             return pd.Series([data] * length, index=range(length))
         elif hasattr(data, '__len__') and len(data) == length:
@@ -3302,7 +3546,7 @@ translatedReason: {reason}
             return pd.Series([fill_value] * length, index=range(length))
     
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """optimize indicator - fix indicator calculate"""
+        """Populate the strategy indicator set for the current pair."""
 
         pair = metadata['pair']
 
@@ -3319,10 +3563,10 @@ translatedReason: {reason}
             logger.warning(f"long not {pair}: {len(dataframe)} < 50")
             # still calculate indicator，but hasNaNvalue
         
-        # translated
+        # Validate raw market data quality before indicator generation
         data_quality_ok = self.validate_real_data_quality(dataframe, pair)
         if not data_quality_ok:
-            logger.warning(f"translated {pair}, but")
+            logger.warning(f"Data quality warnings detected for {pair}; continuing with indicator calculation")
         
         # to indicator calculate
         # cached_indicators = self.get_cached_indicators(pair, len(dataframe))
@@ -3363,7 +3607,7 @@ translatedReason: {reason}
             logger.warning(f"get orderbook data {pair}: {e}")
             orderbook_data = {}
         
-        # at
+        # Required orderbook-derived fields
         required_ob_fields = {
             'volume_ratio': 1.0,
             'spread_pct': 0.1,
@@ -3380,17 +3624,17 @@ translatedReason: {reason}
             'sell_pressure': 0.5   # indicator
         }
         
-        # translated，avoidDataFrametranslated
+        # Build orderbook columns in a temporary dict before concatenation
         ob_columns = {}
         for key, default_value in required_ob_fields.items():
             value = orderbook_data.get(key, default_value)
             if isinstance(value, (int, float, np.number)):
                 ob_columns[f'ob_{key}'] = value
             else:
-                # value，use default value
+                # Fall back to the default value when the orderbook metric is invalid
                 ob_columns[f'ob_{key}'] = default_value
         
-        # 1 times has，useconcatavoidDataFrametranslated
+        # Add orderbook columns in one concat to avoid repeated dataframe mutation
         if ob_columns:
             ob_df = pd.DataFrame(ob_columns, index=dataframe.index)
             dataframe = pd.concat([dataframe, ob_df], axis=1)
@@ -3406,10 +3650,10 @@ translatedReason: {reason}
         # time - to mid
         mtf_analysis = self.analyze_multi_timeframe(dataframe, metadata)
         
-        # will time todataframe
+        # Apply the simplified MTF analysis back onto the dataframe
         dataframe = self.apply_mtf_analysis_to_dataframe(dataframe, mtf_analysis, metadata)
         
-        # signal strength（translated）
+        # Composite signal strength
         dataframe['signal_strength'] = self.calculate_enhanced_signal_strength(dataframe)
 
         # most check
@@ -3417,13 +3661,13 @@ translatedReason: {reason}
             logger.warning(f"most check，at: {pair}")
             dataframe = dataframe[~dataframe.index.duplicated(keep='first')]
 
-        # optimize：translatedDataFrameto avoidPerformanceWarning
+        # Return a copy to avoid chained-assignment warnings downstream
         dataframe = dataframe.copy()
 
         return dataframe
     
     def convert_trend_strength_to_numeric(self, trend_strength):
-        """will trend strength as value"""
+        """Convert textual trend-strength labels to numeric values."""
         if isinstance(trend_strength, (int, float)):
             return trend_strength
         
@@ -3441,45 +3685,43 @@ translatedReason: {reason}
         return 0
     
     def apply_mtf_analysis_to_dataframe(self, dataframe: DataFrame, mtf_analysis: dict, metadata: dict) -> DataFrame:
-        """will time todataframe - translatedMTF"""
+        """Project simplified multi-timeframe analysis back into the dataframe."""
         
-        # === 1. time trend 1 score ===
+        # === 1. Aggregate MTF trend, strength, and risk scores ===
         mtf_trend_score = 0
         mtf_strength_score = 0
         mtf_risk_score = 0
         
-        # time weight：long weight large
+        # Timeframe weights: longer frames carry more influence
         tf_weights = {'1m': 0.1, '15m': 0.15, '1h': 0.25, '4h': 0.3, '1d': 0.2}
         
         for tf, analysis in mtf_analysis.items():
             if tf in tf_weights and analysis:
                 weight = tf_weights[tf]
                 
-                # trend score
+                # Trend direction score
                 if analysis.get('trend_direction') == 'bullish':
                     mtf_trend_score += weight * 1
                 elif analysis.get('trend_direction') == 'bearish':
                     mtf_trend_score -= weight * 1
                 
-                # strength score - fix
+                # Strength score
                 trend_strength_raw = analysis.get('trend_strength', 0)
                 trend_strength_numeric = self.convert_trend_strength_to_numeric(trend_strength_raw)
                 mtf_strength_score += weight * trend_strength_numeric / 100
                 
-                # risk score（RSIvalue）
+                # Risk score based on RSI extremes
                 rsi = analysis.get('rsi', 50)
                 if rsi > 70:
                     mtf_risk_score += weight * (rsi - 70) / 30  # overbought risk
                 elif rsi < 30:
                     mtf_risk_score -= weight * (30 - rsi) / 30  # oversold
         
-        # === 2. time ===
-        # get1hours4hours price
+        # === 2. Pull support/resistance references from higher timeframes ===
         h1_data = mtf_analysis.get('1h', {})
         h4_data = mtf_analysis.get('4h', {})
         
-        # === 3. time signal ===
-        # long-term trend - asSeriestranslated
+        # === 3. Build higher-timeframe directional filters ===
         mtf_long_condition = (
             (mtf_trend_score > 0.3) &  # time
             (mtf_risk_score > -0.5)    # risk
@@ -3490,8 +3732,7 @@ translatedReason: {reason}
             (mtf_risk_score < 0.5)     # risk
         )
         
-        # === 4. time confirm signal ===
-        # long confirm：4hours+day
+        # === 4. Strong directional confirmation from 4h + 1d ===
         h4_trend = h4_data.get('trend_direction', 'neutral')
         d1_trend = mtf_analysis.get('1d', {}).get('trend_direction', 'neutral')
         
@@ -3505,17 +3746,17 @@ translatedReason: {reason}
             (mtf_strength_score > 0.6)
         )
         
-        # has time，avoidDataFrametranslated
+        # Default higher-timeframe support/resistance levels when unavailable
         h1_support = h1_data.get('support_level', dataframe['close'] * 0.99)
         h1_resistance = h1_data.get('resistance_level', dataframe['close'] * 1.01)
         h4_support = h4_data.get('support_level', dataframe['close'] * 0.98)
         h4_resistance = h4_data.get('resistance_level', dataframe['close'] * 1.02)
         
         mtf_columns = {
-            # score indicator
-            'mtf_trend_score': mtf_trend_score,  # [-1, 1] trend 1
-            'mtf_strength_score': mtf_strength_score,  # [0, 1] trend strength
-            'mtf_risk_score': mtf_risk_score,  # [-1, 1] risk/score
+            # Score indicators
+            'mtf_trend_score': mtf_trend_score,  # [-1, 1]
+            'mtf_strength_score': mtf_strength_score,  # [0, 1]
+            'mtf_risk_score': mtf_risk_score,  # [-1, 1]
             
             # price
             'h1_support': h1_support,
@@ -3523,28 +3764,28 @@ translatedReason: {reason}
             'h4_support': h4_support,
             'h4_resistance': h4_resistance,
             
-            # price and
+            # Proximity to higher-timeframe levels
             'near_h1_support': (abs(dataframe['close'] - h1_support) / dataframe['close'] < 0.005).astype(int),
             'near_h1_resistance': (abs(dataframe['close'] - h1_resistance) / dataframe['close'] < 0.005).astype(int),
             'near_h4_support': (abs(dataframe['close'] - h4_support) / dataframe['close'] < 0.01).astype(int),
             'near_h4_resistance': (abs(dataframe['close'] - h4_resistance) / dataframe['close'] < 0.01).astype(int),
             
-            # signal
+            # Directional filters
             'mtf_long_filter': self._safe_series(1 if mtf_long_condition else 0, len(dataframe)),
             'mtf_short_filter': self._safe_series(1 if mtf_short_condition else 0, len(dataframe)),
             
-            # confirm signal
+            # Strong confirmation filters
             'mtf_strong_bull': self._safe_series(1 if mtf_strong_bull_condition else 0, len(dataframe)),
             'mtf_strong_bear': self._safe_series(1 if mtf_strong_bear_condition else 0, len(dataframe))
         }
         
-        # 1 times has time，useconcatavoidDataFrametranslated
+        # Add the generated MTF columns in one batch
         if mtf_columns:
-            # translatedSeriesvalue
+            # Normalize series-like values before dataframe construction
             processed_columns = {}
             for col_name, value in mtf_columns.items():
                 if isinstance(value, pd.Series):
-                    # translatedSerieslong anddataframetranslated
+                    # Align the series length with the dataframe when possible
                     if len(value) == len(dataframe):
                         processed_columns[col_name] = value.values
                     else:
@@ -3743,73 +3984,68 @@ translatedReason: {reason}
         return base_leverage.fillna(1.0).clip(0.5, 5.0)  # 0.5-5leverage
     
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """translated - translated"""
+        """Populate long and short entry signals."""
         
         pair = metadata['pair']
         
-        # === translated ===
-        # calculate price（20translatedKtranslated）
+        # === Price position within the recent 20-candle range ===
         highest_20 = dataframe['high'].rolling(20).max()
         lowest_20 = dataframe['low'].rolling(20).min()
         price_position = (dataframe['close'] - lowest_20) / (highest_20 - lowest_20 + 0.0001)
         
-        # 🚨 fix：price - avoid
-        not_at_top = price_position < 0.80  # to80%，allow at high
-        # at  
-        not_at_bottom = price_position > 0.20  # to20%，allow at low
+        # Avoid chasing extreme range edges
+        not_at_top = price_position < 0.80
+        not_at_bottom = price_position > 0.20
         
-        # === momentum（translated）===
-        # translatedRSImomentum（translated）
+        # === Momentum and participation filters ===
+        # Allow RSI pullbacks without requiring perfect upward momentum
         rsi_momentum_strong = (
-            (dataframe['rsi_14'] - dataframe['rsi_14'].shift(3) > -10) &  # translatedRSIdown
-            (dataframe['rsi_14'] < 80) & (dataframe['rsi_14'] > 20)  # translatedRSIvalue range
+            (dataframe['rsi_14'] - dataframe['rsi_14'].shift(3) > -10) &
+            (dataframe['rsi_14'] < 80) & (dataframe['rsi_14'] > 20)
         )
         
-        # volume support（translated）
+        # Volume support
         volume_support = (
-            (dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 0.6) &  # volume
-            (dataframe['volume'] > dataframe['volume'].shift(1) * 0.7)  # volume
+            (dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 0.6) &
+            (dataframe['volume'] > dataframe['volume'].shift(1) * 0.7)
         )
         
-        # simplified breakout（translated）
+        # Basic fake-breakout filter
         no_fake_breakout = ~(
-            # long（translated）
-            ((dataframe['high'] - dataframe['close']) > (dataframe['close'] - dataframe['open']) * 3) |  # high to3translated
-            ((dataframe['open'] - dataframe['low']) > (dataframe['close'] - dataframe['open']) * 3)       # high to3translated
-            # translated - translated
+            ((dataframe['high'] - dataframe['close']) > (dataframe['close'] - dataframe['open']) * 3) |
+            ((dataframe['open'] - dataframe['low']) > (dataframe['close'] - dataframe['open']) * 3)
         )
         
-        # translated（ADX < 20 none trend）
+        # Trend/range state
         is_trending = dataframe['adx'] > 20
         is_sideways = dataframe['adx'] < 20
         
-        # translated（translated）
-        sideways_filter = ~is_sideways | (dataframe['atr_p'] > 0.02)  # large
+        # Allow sideways conditions only when volatility is still meaningful
+        sideways_filter = ~is_sideways | (dataframe['atr_p'] > 0.02)
         
-        # translated
+        # Baseline environment filter shared by long and short entries
         basic_env = (
-            (dataframe['volume_ratio'] > 0.8) &  # volume not low
-            (dataframe['atr_p'] > 0.001) &       # volatility
-            sideways_filter &                     # translated
-            rsi_momentum_strong &                # RSImomentum
-            volume_support                       # volume support
+            (dataframe['volume_ratio'] > 0.8) &
+            (dataframe['atr_p'] > 0.001) &
+            sideways_filter &
+            rsi_momentum_strong &
+            volume_support
         )
         
-        # 🚨 fix：translated（before60+signal）
-        # long has：trend not + not
+        # Long environment: avoid hostile trend and sentiment extremes
         long_favourable_environment = (
-            basic_env &  # translated
-            (dataframe['trend_strength'] > -40) &  # trend not（translated）
-            (dataframe.get('market_sentiment', 0) > -0.8) &  # not（translated）
-            (dataframe['rsi_14'] > 25)  # RSInot at oversold（avoid）
+            basic_env &
+            (dataframe['trend_strength'] > -40) &
+            (dataframe.get('market_sentiment', 0) > -0.8) &
+            (dataframe['rsi_14'] > 25)
         )
         
-        # short has：trend not + not  
+        # Short environment: avoid hostile trend and sentiment extremes
         short_favourable_environment = (
-            basic_env &  # translated
-            (dataframe['trend_strength'] < 40) &   # trend not（translated）
-            (dataframe.get('market_sentiment', 0) < 0.8) &   # not（translated）
-            (dataframe['rsi_14'] < 75)  # RSInot at overbought（avoid at short）
+            basic_env &
+            (dataframe['trend_strength'] < 40) &
+            (dataframe.get('market_sentiment', 0) < 0.8) &
+            (dataframe['rsi_14'] < 75)
         )
         
         # === 🌍 market state ===
@@ -3818,49 +4054,48 @@ translatedReason: {reason}
         regime_confidence = market_regime_data['confidence']
         signals_advice = market_regime_data['signals_advice']
         
-        # record market state todataframe（after）
+        # Persist the detected market regime into the dataframe
         dataframe.loc[:, 'market_regime'] = current_regime
         dataframe.loc[:, 'regime_confidence'] = regime_confidence
         
         logger.info(
-            f"📊 market state {metadata.get('pair', '')}: "
-            f"{current_regime} (translated:{regime_confidence:.1%}) | "
-            f"signal:{signals_advice.get('recommended_signals', [])} | "
-            f"avoid signal:{signals_advice.get('avoid_signals', [])}"
+            f"📊 Market regime {metadata.get('pair', '')}: "
+            f"{current_regime} (confidence: {regime_confidence:.1%}) | "
+            f"recommended signals: {signals_advice.get('recommended_signals', [])} | "
+            f"avoid signals: {signals_advice.get('avoid_signals', [])}"
         )
         
-        # === 💰 signal ===
+        # === Long signal set ===
         
-        # 🎯 Signal 1: RSIoversold（translated）
-        # === translatedRSIvalue calculate ===
-        # volatilityRSIvalue，high volatility avoid signal
+        # Signal 1: RSI oversold bounce
+        # Dynamic oversold threshold lowers in higher-volatility regimes
         base_oversold = 30
         volatility_percentile = dataframe['atr_p'].rolling(50).rank(pct=True)
-        dynamic_oversold = base_oversold - (volatility_percentile * 8)  # 20-30range
+        dynamic_oversold = base_oversold - (volatility_percentile * 8)  # 20-30 range
         
-        # === confirm ===
+        # Confirmation layers
         rsi_condition = (dataframe['rsi_14'] < dynamic_oversold)
-        rsi_momentum = (dataframe['rsi_14'] > dataframe['rsi_14'].shift(2))  # translated2rise
+        rsi_momentum = (dataframe['rsi_14'] > dataframe['rsi_14'].shift(2))
         price_confirmation = (dataframe['close'] > dataframe['close'].shift(1))
         
-        # === trend confirmation：at rise trend or mid long ===
+        # Trend confirmation: either aligned bullishly or not in a strong trend
         trend_confirmation = (
-            (dataframe['ema_8'] >= dataframe['ema_21']) |  # bullish
-            (dataframe['adx'] < 25)  # or
+            (dataframe['ema_8'] >= dataframe['ema_21']) |
+            (dataframe['adx'] < 25)
         )
         
-        # === volume confirmation：breakout volume support ===
+        # Volume confirmation
         volume_confirmation = (
             dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 1.1
         )
         
-        # === strength confirm：ADXtrend ===
+        # Strength confirmation
         strength_confirmation = (
-            (dataframe['adx'] > 20) &  # most low strength
-            (dataframe['adx'] > dataframe['adx'].shift(2))  # ADXrise
+            (dataframe['adx'] > 20) &
+            (dataframe['adx'] > dataframe['adx'].shift(2))
         )
         
-        # === divergence：avoid at bearish divergence ===
+        # Avoid entries during bearish divergence
         no_bearish_divergence = ~dataframe.get('bearish_divergence', False).astype(bool)
         
         rsi_oversold_bounce = (
@@ -3871,35 +4106,32 @@ translatedReason: {reason}
             volume_confirmation &
             strength_confirmation &
             no_bearish_divergence &
-            not_at_top &  # at
+            not_at_top &
             basic_env
         )
         dataframe.loc[rsi_oversold_bounce, 'enter_long'] = 1
         dataframe.loc[rsi_oversold_bounce, 'enter_tag'] = 'RSI_Oversold_Bounce'
         
-        # 🎯 Signal 2: EMAafter（translated）
+        # Signal 2: EMA golden cross
         ema_golden_cross = (
-            (dataframe['ema_8'] > dataframe['ema_21']) &     # translated
-            (dataframe['ema_8'].shift(3) <= dataframe['ema_21'].shift(3)) &  # 3translatedKbefore
-            (dataframe['close'] <= dataframe['ema_8'] * 1.01) &  # price toEMA8translated
-            (dataframe['close'] > dataframe['ema_21']) &     # but still atEMA21up
-            (dataframe['volume_ratio'] > 1.0) &              # volume
-            # new：momentum
-            (dataframe['momentum_exhaustion_score'] < 0.5) &  # momentum
-            (dataframe['trend_phase'] <= 2) &  # not at trend late stage
-            (~dataframe['bearish_divergence'].astype(bool)) &  # none bearish divergence
+            (dataframe['ema_8'] > dataframe['ema_21']) &
+            (dataframe['ema_8'].shift(3) <= dataframe['ema_21'].shift(3)) &
+            (dataframe['close'] <= dataframe['ema_8'] * 1.01) &
+            (dataframe['close'] > dataframe['ema_21']) &
+            (dataframe['volume_ratio'] > 1.0) &
+            (dataframe['momentum_exhaustion_score'] < 0.5) &
+            (dataframe['trend_phase'] <= 2) &
+            (~dataframe['bearish_divergence'].astype(bool)) &
             basic_env
         )
         dataframe.loc[ema_golden_cross, 'enter_long'] = 1
         dataframe.loc[ema_golden_cross, 'enter_tag'] = 'EMA_Golden_Cross'
         
-        # 🎯 Signal 3: MACDup breakout（fix：translated）
+        # Signal 3: MACD bullish turn
         macd_bullish = (
             (
-                # MACDtranslated - at trend signal
                 ((dataframe['macd'] > dataframe['macd_signal']) & 
                  (dataframe['macd'].shift(1) <= dataframe['macd_signal'].shift(1))) |
-                # or from（confirm）
                 ((dataframe['macd_hist'] > 0) & 
                  (dataframe['macd_hist'].shift(1) <= 0))
             ) &
@@ -3908,55 +4140,53 @@ translatedReason: {reason}
         dataframe.loc[macd_bullish, 'enter_long'] = 1
         dataframe.loc[macd_bullish, 'enter_tag'] = 'MACD_Bullish'
         
-        # 🎯 Signal 4: Bollinger Bands down（confirm）
+        # Signal 4: Bollinger lower-band bounce
         bb_lower_bounce = (
-            (dataframe['close'] <= dataframe['bb_lower'] * 1.005) &  # down
-            (dataframe['close'] > dataframe['close'].shift(1)) &     # price
-            (dataframe['close'].shift(1) > dataframe['close'].shift(2)) &  # 2 times confirm：translated
-            (dataframe['rsi_14'] < 50) &                             # RSIlow
-            (dataframe['rsi_14'] > dataframe['rsi_14'].shift(1)) &  # RSIrise
-            (dataframe['volume_ratio'] > 1.1) &                     # volume
-            not_at_top &  # high
-            no_fake_breakout &  # none breakout risk
+            (dataframe['close'] <= dataframe['bb_lower'] * 1.005) &
+            (dataframe['close'] > dataframe['close'].shift(1)) &
+            (dataframe['close'].shift(1) > dataframe['close'].shift(2)) &
+            (dataframe['rsi_14'] < 50) &
+            (dataframe['rsi_14'] > dataframe['rsi_14'].shift(1)) &
+            (dataframe['volume_ratio'] > 1.1) &
+            not_at_top &
+            no_fake_breakout &
             basic_env
         )
         dataframe.loc[bb_lower_bounce, 'enter_long'] = 1
         dataframe.loc[bb_lower_bounce, 'enter_tag'] = 'BB_Lower_Bounce'
         
-        # Signal 5 translated - Simple_Breakoutbreakout signal
+        # Additional breakout-style signals are handled by the expanded legacy block below
         
-        # === 📉 simplified short signal ===
+        # === Short signal set ===
         
-        # 🎯 Signal 1: RSIoverbought（translated）
-        # === translatedRSIvalue calculate ===
-        # volatilityRSIvalue，high volatility avoid signal
+        # Signal 1: RSI overbought fade
         base_overbought = 70
         volatility_percentile = dataframe['atr_p'].rolling(50).rank(pct=True)
-        dynamic_overbought = base_overbought + (volatility_percentile * 8)  # 70-78range
+        dynamic_overbought = base_overbought + (volatility_percentile * 8)  # 70-78 range
         
-        # === confirm ===
+        # Confirmation layers
         rsi_condition = (dataframe['rsi_14'] > dynamic_overbought)
-        rsi_momentum = (dataframe['rsi_14'] < dataframe['rsi_14'].shift(2))  # translated2fall
+        rsi_momentum = (dataframe['rsi_14'] < dataframe['rsi_14'].shift(2))
         price_confirmation = (dataframe['close'] < dataframe['close'].shift(1))
         
-        # === trend confirmation：at fall trend or mid short ===
+        # Trend confirmation: either aligned bearishly or not in a strong trend
         trend_confirmation = (
-            (dataframe['ema_8'] <= dataframe['ema_21']) |  # bearish
-            (dataframe['adx'] < 25)  # or
+            (dataframe['ema_8'] <= dataframe['ema_21']) |
+            (dataframe['adx'] < 25)
         )
         
-        # === volume confirmation：breakout volume support ===
+        # Volume confirmation
         volume_confirmation = (
             dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 1.1
         )
         
-        # === strength confirm：ADXtrend ===
+        # Strength confirmation
         strength_confirmation = (
-            (dataframe['adx'] > 20) &  # most low strength
-            (dataframe['adx'] > dataframe['adx'].shift(2))  # ADXrise
+            (dataframe['adx'] > 20) &
+            (dataframe['adx'] > dataframe['adx'].shift(2))
         )
         
-        # === divergence：avoid at bullish divergence ===
+        # Avoid entries during bullish divergence
         no_bullish_divergence = ~dataframe.get('bullish_divergence', False).astype(bool)
         
         rsi_overbought_fall = (
@@ -3967,10 +4197,10 @@ translatedReason: {reason}
             volume_confirmation &
             strength_confirmation &
             no_bullish_divergence &
-            not_at_bottom &  # at
+            not_at_bottom &
             basic_env
         )
-        # === 📊 signal score ===
+        # Signal-quality scores
         rsi_long_score = self._calculate_signal_quality_score(
             dataframe, rsi_oversold_bounce, 'RSI_Oversold_Bounce'
         )
@@ -3978,24 +4208,23 @@ translatedReason: {reason}
             dataframe, rsi_overbought_fall, 'RSI_Overbought_Fall'
         )
         
-        # === 📊 market state signal ===
-        # has high+market state signal
+        # Apply market-regime preferences to the RSI signals
         
-        # RSIlong signal
+        # Long RSI signal
         rsi_long_regime_ok = 'RSI_Oversold_Bounce' not in signals_advice.get('avoid_signals', [])
         high_quality_long = rsi_oversold_bounce & (rsi_long_score >= 6) & rsi_long_regime_ok
         
-        # RSIshort signal  
+        # Short RSI signal
         rsi_short_regime_ok = 'RSI_Overbought_Fall' not in signals_advice.get('avoid_signals', [])
         high_quality_short = rsi_overbought_fall & (rsi_short_score >= 6) & rsi_short_regime_ok
         
-        # market state：at mid low
+        # Give a small score concession to regime-favored signals
         if 'RSI_Oversold_Bounce' in signals_advice.get('recommended_signals', []):
-            regime_bonus_long = rsi_oversold_bounce & (rsi_long_score >= 5)  # low1translated
+            regime_bonus_long = rsi_oversold_bounce & (rsi_long_score >= 5)
             high_quality_long = high_quality_long | regime_bonus_long
             
         if 'RSI_Overbought_Fall' in signals_advice.get('recommended_signals', []):
-            regime_bonus_short = rsi_overbought_fall & (rsi_short_score >= 5)  # low1translated  
+            regime_bonus_short = rsi_overbought_fall & (rsi_short_score >= 5)
             high_quality_short = high_quality_short | regime_bonus_short
         
         dataframe.loc[high_quality_long, 'enter_long'] = 1
@@ -4008,24 +4237,22 @@ translatedReason: {reason}
         dataframe.loc[high_quality_short, 'signal_quality'] = rsi_short_score
         dataframe.loc[high_quality_short, 'market_regime_bonus'] = 'RSI_Overbought_Fall' in signals_advice.get('recommended_signals', [])
         
-        # 🎯 Signal 2: EMAafter（translated）
+        # Signal 2: EMA death cross
         ema_death_cross = (
-            (dataframe['ema_8'] < dataframe['ema_21']) &     # translated
-            (dataframe['ema_8'].shift(3) >= dataframe['ema_21'].shift(3)) &  # 3translatedKbefore
-            (dataframe['close'] >= dataframe['ema_8'] * 0.99) &  # price toEMA8translated
-            (dataframe['close'] < dataframe['ema_21']) &     # but still atEMA21down
-            (dataframe['volume_ratio'] > 1.0) &              # volume
-            # new：momentum
-            (dataframe['momentum_exhaustion_score'] < 0.5) &  # momentum
-            (dataframe['trend_phase'] <= 2) &  # not at trend late stage
-            (~dataframe['bullish_divergence'].astype(bool)) &  # none bullish divergence
+            (dataframe['ema_8'] < dataframe['ema_21']) &
+            (dataframe['ema_8'].shift(3) >= dataframe['ema_21'].shift(3)) &
+            (dataframe['close'] >= dataframe['ema_8'] * 0.99) &
+            (dataframe['close'] < dataframe['ema_21']) &
+            (dataframe['volume_ratio'] > 1.0) &
+            (dataframe['momentum_exhaustion_score'] < 0.5) &
+            (dataframe['trend_phase'] <= 2) &
+            (~dataframe['bullish_divergence'].astype(bool)) &
             basic_env
         )
         dataframe.loc[ema_death_cross, 'enter_short'] = 1
         dataframe.loc[ema_death_cross, 'enter_tag'] = 'EMA_Death_Cross'
         
-        # 🎯 Signal 3: MACDsignal（translated）
-        # === MACDsignal ===
+        # Signal 3: MACD bearish turn
         macd_death_cross = (
             (dataframe['macd'] < dataframe['macd_signal']) & 
             (dataframe['macd'].shift(1) >= dataframe['macd_signal'].shift(1))
@@ -4036,46 +4263,46 @@ translatedReason: {reason}
         )
         macd_basic_signal = macd_death_cross | macd_hist_negative
         
-        # === 🛡️ translated - signal ===
+        # Guardrails for short-side MACD entries
         
-        # 1. trend confirm：avoid at rise trend mid short
+        # 1. Trend confirmation: avoid shorting into bullish structure
         trend_bearish = (
-            (dataframe['ema_8'] < dataframe['ema_21']) &  # EMAbearish
-            (dataframe['ema_21'] < dataframe['ema_50']) & # mid long-term trend down
-            (dataframe['close'] < dataframe['ema_21'])     # price at trend down
+            (dataframe['ema_8'] < dataframe['ema_21']) &
+            (dataframe['ema_21'] < dataframe['ema_50']) &
+            (dataframe['close'] < dataframe['ema_21'])
         )
         
-        # 2. momentum confirm：down momentum at
+        # 2. Momentum confirmation
         momentum_confirmation = (
-            (dataframe['rsi_14'] < 55) &                  # RSItranslated
-            (dataframe['rsi_14'] < dataframe['rsi_14'].shift(2)) &  # RSIdown
-            (dataframe['close'] < dataframe['close'].shift(2))      # price down
+            (dataframe['rsi_14'] < 55) &
+            (dataframe['rsi_14'] < dataframe['rsi_14'].shift(2)) &
+            (dataframe['close'] < dataframe['close'].shift(2))
         )
         
-        # 3. volume confirmation：down volume support
+        # 3. Volume confirmation
         volume_confirmation = (
             (dataframe['volume'] > dataframe['volume'].rolling(20).mean() * 1.1) &
-            (dataframe['volume'] > dataframe['volume'].shift(1))  # volume
+            (dataframe['volume'] > dataframe['volume'].shift(1))
         )
         
-        # 4. strength confirm：ADXtrend
+        # 4. Strength confirmation
         strength_confirmation = (
-            (dataframe['adx'] > 25) &                     # has 1 trend strength
-            (dataframe['adx'] > dataframe['adx'].shift(3)) # ADXrise trend
+            (dataframe['adx'] > 25) &
+            (dataframe['adx'] > dataframe['adx'].shift(3))
         )
         
-        # 5. translated：avoid at mid
-        not_sideways = (dataframe['adx'] > 20)            # not at
+        # 5. Avoid sideways markets
+        not_sideways = (dataframe['adx'] > 20)
         
-        # 6. confirm：at high short
+        # 6. Confirm price is still extended enough to short
         position_confirmation = (
-            dataframe['close'] > dataframe['close'].rolling(20).mean() * 1.02  # price high
+            dataframe['close'] > dataframe['close'].rolling(20).mean() * 1.02
         )
         
-        # 7. divergence：avoid at bullish divergence short
+        # 7. Avoid shorting into bullish divergence
         no_bullish_divergence = ~dataframe.get('bullish_divergence', False).astype(bool)
         
-        # === mostMACDsignal ===
+        # Final MACD bearish entry
         macd_bearish = (
             macd_basic_signal &
             trend_bearish &
@@ -4085,21 +4312,20 @@ translatedReason: {reason}
             not_sideways &
             position_confirmation &
             no_bullish_divergence &
-            not_at_bottom &  # at
+            not_at_bottom &
             basic_env
         )
         
-        # === 📊 MACDsignal score ===
+        # MACD quality score
         macd_score = self._calculate_macd_signal_quality(dataframe, macd_bearish, 'MACD_Bearish')
         
-        # === 📊 MACDmarket state ===
-        # MACDsignal market state confirm
+        # Market-regime filter for MACD bearish entries
         macd_regime_ok = 'MACD_Bearish' not in signals_advice.get('avoid_signals', [])
-        high_quality_macd = macd_bearish & (macd_score >= 7) & macd_regime_ok  # MACDhigh+confirm
+        high_quality_macd = macd_bearish & (macd_score >= 7) & macd_regime_ok
         
-        # market state：at down trend mid lowMACDtranslated
+        # Small score concession if the regime explicitly favors this signal
         if 'MACD_Bearish' in signals_advice.get('recommended_signals', []):
-            regime_bonus_macd = macd_bearish & (macd_score >= 6) & macd_regime_ok  # low1translated
+            regime_bonus_macd = macd_bearish & (macd_score >= 6) & macd_regime_ok
             high_quality_macd = high_quality_macd | regime_bonus_macd
         
         dataframe.loc[high_quality_macd, 'enter_short'] = 1
@@ -4107,70 +4333,70 @@ translatedReason: {reason}
         dataframe.loc[high_quality_macd, 'signal_quality'] = macd_score
         dataframe.loc[high_quality_macd, 'market_regime_bonus'] = 'MACD_Bearish' in signals_advice.get('recommended_signals', [])
         
-        # 🎯 Signal 4: Bollinger Bands up
+        # Signal 4: Bollinger upper-band rejection
         bb_upper_rejection = (
-            (dataframe['close'] >= dataframe['bb_upper'] * 0.995) &  # up
-            (dataframe['close'] < dataframe['close'].shift(1)) &     # price
-            (dataframe['rsi_14'] > 50) &                             # RSIhigh
-            (dataframe['volume_ratio'] > 1.1) &                     # volume
+            (dataframe['close'] >= dataframe['bb_upper'] * 0.995) &
+            (dataframe['close'] < dataframe['close'].shift(1)) &
+            (dataframe['rsi_14'] > 50) &
+            (dataframe['volume_ratio'] > 1.1) &
             basic_env
         )
         dataframe.loc[bb_upper_rejection, 'enter_short'] = 1
         dataframe.loc[bb_upper_rejection, 'enter_tag'] = 'BB_Upper_Rejection'
         
-        # Signal 5 translated - Simple_Breakdownbreakout signal
+        # Additional short breakdown-style signals are handled by the expanded legacy block below
         
         # ==============================
-        # 🚨 new：position size weight - signal
+        # Signal-derived sizing overlays
         # ==============================
         
-        # 1. signal score
+        # Aggregate signal quality metrics
         dataframe['signal_quality_score'] = self._calculate_signal_quality(dataframe)
         dataframe['position_weight'] = self._calculate_position_weight(dataframe)
         dataframe['leverage_multiplier'] = self._calculate_leverage_multiplier(dataframe)
         
-        # signal
+        # Signal counts
         total_long_signals = dataframe['enter_long'].sum()
         total_short_signals = dataframe['enter_short'].sum()
         
-        # translated
+        # Environment pass rates
         env_basic_rate = basic_env.sum() / len(dataframe) * 100
         env_long_rate = long_favourable_environment.sum() / len(dataframe) * 100  
         env_short_rate = short_favourable_environment.sum() / len(dataframe) * 100
         
-        # has signal
+        # Entry summary
         if total_long_signals > 0 or total_short_signals > 0:
             logger.info(f"""
-🔥 fix - {metadata['pair']}:
-📊 signal:
-   └─ long signal: {total_long_signals} count
-   └─ short signal: {total_short_signals} count
-   └─ signal: {total_long_signals + total_short_signals} count
+🔥 Entry summary - {metadata['pair']}:
+📊 Signals:
+   └─ Long signals: {total_long_signals}
+   └─ Short signals: {total_short_signals}
+   └─ Total signals: {total_long_signals + total_short_signals}
 
-🌍 translated:
-   └─ translated: {env_basic_rate:.1f}%
-   └─ long: {env_long_rate:.1f}%  
-   └─ short: {env_short_rate:.1f}%
+🌍 Environment pass rates:
+   └─ Basic environment: {env_basic_rate:.1f}%
+   └─ Long environment: {env_long_rate:.1f}%
+   └─ Short environment: {env_short_rate:.1f}%
 
-✅ fix: translated，60+signal new！
+✅ Entry filters active and producing signals
 """)
         
-        # has signal，translated
+        # No-signal diagnostic
         if total_long_signals == 0 and total_short_signals == 0:
             logger.warning(f"""
-⚠️  none signal - {metadata['pair']}:
-🔍 translatedReason:
-   └─ translated: {100-env_basic_rate:.1f}% Ktranslated
-   └─ long: {100-env_long_rate:.1f}% Knot long
-   └─ short: {100-env_short_rate:.1f}% Knot short
+⚠️ No entry signals - {metadata['pair']}:
+🔍 Rejection breakdown:
+   └─ Basic environment rejected: {100-env_basic_rate:.1f}%
+   └─ Long environment rejected: {100-env_long_rate:.1f}%
+   └─ Short environment rejected: {100-env_short_rate:.1f}%
    
-💡 translated: checkRSI({dataframe['rsi_14'].iloc[-1]:.1f}), trend strength({dataframe.get('trend_strength', [0]).iloc[-1]:.1f})
+💡 Check RSI ({dataframe['rsi_14'].iloc[-1]:.1f}) and trend strength ({dataframe.get('trend_strength', [0]).iloc[-1]:.1f})
 """)
         
         return dataframe
     
     def _legacy_populate_entry_trend_backup(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """old signal（translated）"""
+        """Legacy backup entry-signal implementation."""
         
         # 0A. price as - most fast reversal signal
         price_action_bottom = (
@@ -4870,39 +5096,39 @@ translatedReason: {reason}
         signal_balance_ratio = total_long_signals / (total_short_signals + 1e-6)  # avoid
         
         logger.info(f"""
-🎯 signal - {pair} (optimize after):
+🎯 Signal overview - {pair}:
 {'='*60}
-📊 signal:
-├─ bullish signal: {total_long_signals}
-├─ bearish signal: {total_short_signals}
-├─ translated: {signal_balance_ratio:.2f} {'✅translated' if 0.5 <= signal_balance_ratio <= 2.0 else '⚠️translated'}
-└─ translated: {signal_counts if signal_counts else 'before none signal'}
+📊 Signal counts:
+├─ Bullish signals: {total_long_signals}
+├─ Bearish signals: {total_short_signals}
+├─ Balance ratio: {signal_balance_ratio:.2f} {'✅ balanced' if 0.5 <= signal_balance_ratio <= 2.0 else '⚠️ skewed'}
+└─ Signal breakdown: {signal_counts if signal_counts else 'no active signals'}
 
-📈 before market state:
-├─ price: {price_percentile_20.iloc[-1] if len(price_percentile_20) > 0 else 0:.1%}translated ({price_percentile_50.iloc[-1] if len(price_percentile_50) > 0 else 0:.1%}long)
-├─ bullish: {'✅' if (price_percentile_20.iloc[-1] if len(price_percentile_20) > 0 else 0) < 0.55 else '❌'}long most
-├─ bearish: {'✅' if (price_percentile_20.iloc[-1] if len(price_percentile_20) > 0 else 0) > 0.45 else '❌'}short most
+📈 Market context:
+├─ 20-period price percentile: {price_percentile_20.iloc[-1] if len(price_percentile_20) > 0 else 0:.1%} (50-period: {price_percentile_50.iloc[-1] if len(price_percentile_50) > 0 else 0:.1%})
+├─ Bullish location bias: {'✅ favorable' if (price_percentile_20.iloc[-1] if len(price_percentile_20) > 0 else 0) < 0.55 else '❌ stretched'}
+├─ Bearish location bias: {'✅ favorable' if (price_percentile_20.iloc[-1] if len(price_percentile_20) > 0 else 0) > 0.45 else '❌ compressed'}
 ├─ RSI: {dataframe['rsi_14'].iloc[-1] if 'rsi_14' in dataframe.columns and len(dataframe) > 0 else 50:.1f}
-├─ ADXtrend strength: {dataframe['adx'].iloc[-1] if 'adx' in dataframe.columns and len(dataframe) > 0 else 25:.1f}
-├─ volume: {dataframe['volume_ratio'].iloc[-1] if 'volume_ratio' in dataframe.columns and len(dataframe) > 0 else 1:.2f}x
-├─ trend score: {dataframe['trend_strength'].iloc[-1] if 'trend_strength' in dataframe.columns and len(dataframe) > 0 else 50:.0f}/100
-├─ momentum score: {dataframe['momentum_score'].iloc[-1] if 'momentum_score' in dataframe.columns and len(dataframe) > 0 else 0:.3f}
-├─ translated: {dataframe['market_sentiment'].iloc[-1] if 'market_sentiment' in dataframe.columns and len(dataframe) > 0 else 0:.3f}
-└─ divergence strength: {dataframe['rsi_divergence_strength'].iloc[-1] if 'rsi_divergence_strength' in dataframe.columns and len(dataframe) > 0 else 0:.3f}
+├─ ADX trend strength: {dataframe['adx'].iloc[-1] if 'adx' in dataframe.columns and len(dataframe) > 0 else 25:.1f}
+├─ Volume ratio: {dataframe['volume_ratio'].iloc[-1] if 'volume_ratio' in dataframe.columns and len(dataframe) > 0 else 1:.2f}x
+├─ Trend score: {dataframe['trend_strength'].iloc[-1] if 'trend_strength' in dataframe.columns and len(dataframe) > 0 else 50:.0f}/100
+├─ Momentum score: {dataframe['momentum_score'].iloc[-1] if 'momentum_score' in dataframe.columns and len(dataframe) > 0 else 0:.3f}
+├─ Market sentiment: {dataframe['market_sentiment'].iloc[-1] if 'market_sentiment' in dataframe.columns and len(dataframe) > 0 else 0:.3f}
+└─ Divergence strength: {dataframe['rsi_divergence_strength'].iloc[-1] if 'rsi_divergence_strength' in dataframe.columns and len(dataframe) > 0 else 0:.3f}
 
-🎯 predictive signal:
-├─ bullish signal: 4count high signal (volume divergence/momentum/reversal/translated)
-├─ bearish signal: 4count high signal (volume divergence/momentum/reversal/translated)
-└─ signal: bullish15count vs bearish15count (translated)
+🎯 Predictive-signal notes:
+├─ Bullish side includes high-conviction divergence, momentum, reversal, and MTF setups
+├─ Bearish side includes the mirrored high-conviction divergence, momentum, reversal, and MTF setups
+└─ This summary compares the broader bullish and bearish signal families
 {'='*60}
 """)
         
         return dataframe
     
     def _log_enhanced_entry_decision(self, pair: str, dataframe: DataFrame, current_data, direction: str):
-        """record"""
+        """Log detailed reasoning for an entry decision."""
         
-        # get
+        # Current entry tag
         entry_tag = current_data.get('enter_tag', 'UNKNOWN_SIGNAL')
         
         # signal
@@ -4911,17 +5137,17 @@ translatedReason: {reason}
             'MACD_MOMENTUM_CONFIRMED': 'MACDmomentum confirm - MACDand long，momentum',
             'OVERSOLD_SUPPORT_BOUNCE': 'oversold support - RSIoversold after，support confirm has',
             'BREAKOUT_RETEST_HOLD': 'breakout confirm - breakout after not，trend',
-            'INSTITUTIONAL_ACCUMULATION': 'translated - large，translated',
-            'DEATH_CROSS_BREAKDOWN': 'translated - EMA8downEMA21，confirm fall trend',
-            'MACD_MOMENTUM_BEARISH': 'MACDmomentum confirm - MACDand fall，momentum',
-            'OVERBOUGHT_RESISTANCE_REJECT': 'overbought resistance - RSIoverbought after，resistance has',
-            'BREAKDOWN_RETEST_FAIL': 'translated - support after none',
-            'INSTITUTIONAL_DISTRIBUTION': 'translated - large，translated'
+            'INSTITUTIONAL_ACCUMULATION': 'institutional-style accumulation with volume and orderbook support',
+            'DEATH_CROSS_BREAKDOWN': 'EMA8 crossed below EMA21 with bearish trend confirmation',
+            'MACD_MOMENTUM_BEARISH': 'MACD bearish momentum confirmation',
+            'OVERBOUGHT_RESISTANCE_REJECT': 'overbought rejection from resistance',
+            'BREAKDOWN_RETEST_FAIL': 'breakdown retest failed at resistance',
+            'INSTITUTIONAL_DISTRIBUTION': 'institutional-style distribution with selling pressure'
         }
         
         signal_type = signal_explanations.get(entry_tag, f'signal confirm - {entry_tag}')
         
-        # translated
+        # Normalized technical snapshot used for decision explanations
         technical_analysis = {
             'rsi_14': current_data.get('rsi_14', 50),
             'macd': current_data.get('macd', 0),
@@ -4939,7 +5165,7 @@ translatedReason: {reason}
             'ob_market_quality': current_data.get('ob_market_quality', 0.5)
         }
         
-        # reason
+        # Human-readable reasoning string
         entry_reasoning = self._build_entry_reasoning(entry_tag, technical_analysis, direction)
         
         signal_details = {
@@ -4963,63 +5189,63 @@ translatedReason: {reason}
             'risk_level': self._assess_entry_risk_level(technical_analysis)
         }
         
-        # translated decision_logger day record
+        # Reserved for integration with an external decision logger
         pass
     
     def _build_entry_reasoning(self, entry_tag: str, tech: dict, direction: str) -> str:
-        """reason"""
+        """Build a concise human-readable explanation for the entry signal."""
         
         reasoning_templates = {
-            'GOLDEN_CROSS_BREAKOUT': f"EMA8({tech['ema_8']:.2f})upEMA21({tech['ema_21']:.2f})translated，price breakoutEMA50({tech['ema_50']:.2f})confirm trend，ADX({tech['adx']:.1f})trend strength，volume large{tech['volume_ratio']:.1f}confirm breakout has",
+            'GOLDEN_CROSS_BREAKOUT': f"EMA8 ({tech['ema_8']:.2f}) crossed above EMA21 ({tech['ema_21']:.2f}), price is above EMA50 ({tech['ema_50']:.2f}), ADX ({tech['adx']:.1f}) confirms trend strength, and volume ratio ({tech['volume_ratio']:.1f}) supports the breakout",
             
-            'MACD_MOMENTUM_CONFIRMED': f"MACD({tech['macd']:.4f})up signal({tech['macd_signal']:.4f})translated，translated({tech['macd_hist']:.4f})as and long，momentum score{tech['momentum_score']:.3f}rise，price upVWAPconfirm",
+            'MACD_MOMENTUM_CONFIRMED': f"MACD ({tech['macd']:.4f}) is above the signal line ({tech['macd_signal']:.4f}), histogram ({tech['macd_hist']:.4f}) is positive, momentum score ({tech['momentum_score']:.3f}) is improving, and price is holding above VWAP",
             
-            'OVERSOLD_SUPPORT_BOUNCE': f"RSI({tech['rsi_14']:.1f})from oversold，Bollinger Bands({tech['bb_position']:.2f})price down after，volume{tech['volume_ratio']:.1f}large confirm，translated({tech['ob_depth_imbalance']:.2f})translated",
+            'OVERSOLD_SUPPORT_BOUNCE': f"RSI ({tech['rsi_14']:.1f}) is rebounding from oversold, Bollinger position ({tech['bb_position']:.2f}) indicates lower-range support, volume ratio ({tech['volume_ratio']:.1f}) confirms interest, and orderbook imbalance ({tech['ob_depth_imbalance']:.2f}) is supportive",
             
-            'BREAKOUT_RETEST_HOLD': f"price breakout supertrend Bollinger Bands mid after，translatedEMA21support has，ADX({tech['adx']:.1f})confirm trend，volatility at range，volume{tech['volume_ratio']:.1f}support breakout",
+            'BREAKOUT_RETEST_HOLD': f"Price held a breakout above the key trend baseline, EMA21 is acting as support, ADX ({tech['adx']:.1f}) confirms the trend, volatility remains controlled, and volume ratio ({tech['volume_ratio']:.1f}) supports continuation",
             
-            'INSTITUTIONAL_ACCUMULATION': f"translated({tech['ob_depth_imbalance']:.2f})large，abnormal volume spike{tech['volume_ratio']:.1f}translated，price upVWAP，trend strength({tech['trend_strength']:.0f})translated",
+            'INSTITUTIONAL_ACCUMULATION': f"Orderbook imbalance ({tech['ob_depth_imbalance']:.2f}) suggests accumulation, volume ratio ({tech['volume_ratio']:.1f}) shows elevated activity, price is above VWAP, and trend strength ({tech['trend_strength']:.0f}) supports continuation",
             
-            'DEATH_CROSS_BREAKDOWN': f"EMA8({tech['ema_8']:.2f})downEMA21({tech['ema_21']:.2f})translated，priceEMA50({tech['ema_50']:.2f})confirm trend，ADX({tech['adx']:.1f})down trend strength，translated{tech['volume_ratio']:.1f}confirm",
+            'DEATH_CROSS_BREAKDOWN': f"EMA8 ({tech['ema_8']:.2f}) crossed below EMA21 ({tech['ema_21']:.2f}), price is below EMA50 ({tech['ema_50']:.2f}), ADX ({tech['adx']:.1f}) confirms bearish trend strength, and volume ratio ({tech['volume_ratio']:.1f}) supports the move",
             
-            'MACD_MOMENTUM_BEARISH': f"MACD({tech['macd']:.4f})down signal({tech['macd_signal']:.4f})translated，translated({tech['macd_hist']:.4f})as and fall，momentum score{tech['momentum_score']:.3f}down，priceVWAPconfirm",
+            'MACD_MOMENTUM_BEARISH': f"MACD ({tech['macd']:.4f}) is below the signal line ({tech['macd_signal']:.4f}), histogram ({tech['macd_hist']:.4f}) is weakening, momentum score ({tech['momentum_score']:.3f}) is falling, and price remains below VWAP",
             
-            'OVERBOUGHT_RESISTANCE_REJECT': f"RSI({tech['rsi_14']:.1f})from overbought，Bollinger Bands({tech['bb_position']:.2f})price at up，volume{tech['volume_ratio']:.1f}confirm，resistance has",
+            'OVERBOUGHT_RESISTANCE_REJECT': f"RSI ({tech['rsi_14']:.1f}) is fading from overbought, Bollinger position ({tech['bb_position']:.2f}) is near the upper band, volume ratio ({tech['volume_ratio']:.1f}) confirms participation, and resistance is holding",
             
-            'BREAKDOWN_RETEST_FAIL': f"price supertrend Bollinger Bands mid after，translatedEMA21resistance，ADX({tech['adx']:.1f})confirm down trend，volume{tech['volume_ratio']:.1f}support",
+            'BREAKDOWN_RETEST_FAIL': f"Price failed a retest after breaking down, EMA21 is acting as resistance, ADX ({tech['adx']:.1f}) confirms bearish trend strength, and volume ratio ({tech['volume_ratio']:.1f}) supports continuation",
             
-            'INSTITUTIONAL_DISTRIBUTION': f"translated({tech['ob_depth_imbalance']:.2f})large，abnormal volume spike{tech['volume_ratio']:.1f}translated，priceVWAP，trend strength({tech['trend_strength']:.0f})translated"
+            'INSTITUTIONAL_DISTRIBUTION': f"Orderbook imbalance ({tech['ob_depth_imbalance']:.2f}) suggests distribution, volume ratio ({tech['volume_ratio']:.1f}) shows elevated activity, price is below VWAP, and trend strength ({tech['trend_strength']:.0f}) supports downside follow-through"
         }
         
-        return reasoning_templates.get(entry_tag, f"translated{entry_tag}signal confirm，indicator{direction}translated")
+        return reasoning_templates.get(entry_tag, f"{entry_tag} signal confirmed with {direction.lower()}-side indicator alignment")
     
     def _assess_entry_risk_level(self, tech: dict) -> str:
-        """risk level"""
+        """Assess the qualitative risk level of a proposed entry."""
         risk_score = 0
         
-        # ADXrisk
+        # ADX contribution
         if tech['adx'] > 30:
-            risk_score += 1  # strong trend low risk
+            risk_score += 1
         elif tech['adx'] < 20:
-            risk_score -= 1  # trend risk
+            risk_score -= 1
             
-        # volume risk
+        # Volume contribution
         if tech['volume_ratio'] > 1.5:
-            risk_score += 1  # low risk
+            risk_score += 1
         elif tech['volume_ratio'] < 0.8:
-            risk_score -= 1  # risk
+            risk_score -= 1
             
-        # risk
+        # Market-quality contribution
         if tech['ob_market_quality'] > 0.6:
-            risk_score += 1  # high low risk
+            risk_score += 1
         elif tech['ob_market_quality'] < 0.3:
-            risk_score -= 1  # low risk
+            risk_score -= 1
             
-        # volatility risk (translatedRSIvalue)
+        # Avoid extreme RSI conditions
         if 25 < tech['rsi_14'] < 75:
-            risk_score += 1  # low risk
+            risk_score += 1
         else:
-            risk_score -= 1  # value risk
+            risk_score -= 1
         
         if risk_score >= 2:
             return "low risk"
@@ -5029,7 +5255,7 @@ translatedReason: {reason}
             return "high risk"
     
     def _log_short_entry_decision(self, pair: str, dataframe: DataFrame, current_data):
-        """record bearish"""
+        """Record short-entry decision context."""
         
         signal_type = self._determine_short_signal_type(current_data)
         
@@ -5506,23 +5732,23 @@ translatedReason: {reason}
     # ===== translated =====
     
     def initialize_risk_control_system(self):
-        """initialize"""
-        # translated
+        """Initialize the portfolio risk-control system."""
+        # Core risk-control state
         self.risk_control_enabled = True
         self.emergency_mode = False
         self.circuit_breaker_active = False
         
-        # risk
+        # Risk-budget configuration
         self.risk_budgets = {
-            'daily_var_budget': 0.02,      # dayVaRtranslated2%
-            'weekly_var_budget': 0.05,     # translatedVaRtranslated5%
-            'monthly_var_budget': 0.12,    # translatedVaRtranslated12%
-            'position_var_limit': 0.01,    # translatedVaRtranslated1%
-            'correlation_limit': 0.7,      # translated70%
-            'sector_exposure_limit': 0.3   # translated30%
+            'daily_var_budget': 0.02,      # 2% daily VaR budget
+            'weekly_var_budget': 0.05,     # 5% weekly VaR budget
+            'monthly_var_budget': 0.12,    # 12% monthly VaR budget
+            'position_var_limit': 0.01,    # 1% per-position VaR limit
+            'correlation_limit': 0.7,      # 70% correlation limit
+            'sector_exposure_limit': 0.3   # 30% sector exposure limit
         }
         
-        # risk use
+        # Current risk-budget utilization
         self.risk_utilization = {
             'current_daily_var': 0.0,
             'current_weekly_var': 0.0,
@@ -5531,28 +5757,28 @@ translatedReason: {reason}
             'sector_exposures': {}
         }
         
-        # value
+        # Circuit-breaker thresholds
         self.circuit_breakers = {
             'daily_loss_limit': -0.08,      # day loss8%
             'hourly_loss_limit': -0.03,     # hours loss3%
             'consecutive_loss_limit': 6,     # loss
             'drawdown_limit': -0.20,        # most large drawdown20%
             'volatility_spike_limit': 5.0,  # volatility
-            'correlation_spike_limit': 0.9  # translated
+            'correlation_spike_limit': 0.9  # extreme correlation spike
         }
         
-        # risk record
+        # Risk-event history
         self.risk_events = []
         self.emergency_actions = []
         
-        # risk
+        # Risk-check cadence
         self.last_risk_check_time = datetime.now(timezone.utc)
-        self.risk_check_interval = 60  # check60translated
+        self.risk_check_interval = 60  # check every 60 seconds
         
     def comprehensive_risk_check(self, pair: str, current_price: float, 
                                proposed_position_size: float, 
                                proposed_leverage: int) -> Dict[str, Any]:
-        """risk check - translated"""
+        """Run the full pre-trade risk-control pipeline."""
         
         risk_status = {
             'approved': True,
@@ -5566,7 +5792,7 @@ translatedReason: {reason}
         try:
             current_time = datetime.now(timezone.utc)
             
-            # 1. check
+            # 1. Circuit-breaker check
             circuit_breaker_result = self.check_circuit_breakers()
             if circuit_breaker_result['triggered']:
                 risk_status['approved'] = False
@@ -5574,25 +5800,25 @@ translatedReason: {reason}
                 risk_status['risk_violations'].append(circuit_breaker_result)
                 return risk_status
             
-            # 2. VaRcheck
+            # 2. VaR budget check
             var_check_result = self.check_var_budget_limits(pair, proposed_position_size)
             if not var_check_result['within_limits']:
                 risk_status['adjusted_position_size'] *= var_check_result['adjustment_factor']
                 risk_status['risk_warnings'].append(var_check_result)
             
-            # 3. check
+            # 3. Correlation check
             correlation_check_result = self.check_correlation_limits(pair, proposed_position_size)
             if not correlation_check_result['within_limits']:
                 risk_status['adjusted_position_size'] *= correlation_check_result['adjustment_factor']
                 risk_status['risk_warnings'].append(correlation_check_result)
             
-            # 4. mid risk check
+            # 4. Concentration-risk check
             concentration_check_result = self.check_concentration_risk(pair, proposed_position_size)
             if not concentration_check_result['within_limits']:
                 risk_status['adjusted_position_size'] *= concentration_check_result['adjustment_factor']
                 risk_status['risk_warnings'].append(concentration_check_result)
             
-            # 5. risk check
+            # 5. Liquidity-risk check
             liquidity_check_result = self.check_liquidity_risk(pair, proposed_position_size)
             if not liquidity_check_result['sufficient_liquidity']:
                 risk_status['adjusted_position_size'] *= liquidity_check_result['adjustment_factor']
@@ -5604,19 +5830,19 @@ translatedReason: {reason}
                 risk_status['adjusted_leverage'] = leverage_check_result['max_allowed_leverage']
                 risk_status['risk_warnings'].append(leverage_check_result)
             
-            # 7. time risk check
+            # 7. Time-based risk check
             time_risk_result = self.check_time_based_risk(current_time)
             if time_risk_result['high_risk_period']:
                 risk_status['adjusted_position_size'] *= time_risk_result['adjustment_factor']
                 risk_status['risk_warnings'].append(time_risk_result)
             
-            # most not most small/most large
+            # Clamp the final adjusted position size
             risk_status['adjusted_position_size'] = max(
                 0.005, 
                 min(risk_status['adjusted_position_size'], self.max_position_size * 0.8)
             )
             
-            # record risk check
+            # Record the risk-check result
             self.record_risk_event('risk_check', risk_status)
             
         except Exception as e:
@@ -5624,22 +5850,22 @@ translatedReason: {reason}
             risk_status['emergency_action'] = 'system_error'
             risk_status['risk_violations'].append({
                 'type': 'system_error',
-                'message': f'translated: {str(e)}'
-            })
+                    'message': f'Risk-check system error: {str(e)}'
+                })
         
         return risk_status
     
     def check_circuit_breakers(self) -> Dict[str, Any]:
-        """check"""
+        """Check whether any circuit breaker should halt trading."""
         try:
             current_time = datetime.now(timezone.utc)
             
-            # get before
+            # Current equity and PnL snapshots
             current_equity = getattr(self, 'current_equity', 100000)  # default value
             daily_pnl = getattr(self, 'daily_pnl', 0)
             hourly_pnl = getattr(self, 'hourly_pnl', 0)
             
-            # 1. day loss
+            # 1. Daily loss
             daily_loss_pct = daily_pnl / current_equity if current_equity > 0 else 0
             if daily_loss_pct < self.circuit_breakers['daily_loss_limit']:
                 return {
@@ -5647,10 +5873,10 @@ translatedReason: {reason}
                     'type': 'daily_loss_circuit_breaker',
                     'current_value': daily_loss_pct,
                     'limit': self.circuit_breakers['daily_loss_limit'],
-                    'message': f'day loss: {daily_loss_pct:.2%}'
-                }
+                        'message': f'daily loss limit hit: {daily_loss_pct:.2%}'
+                    }
             
-            # 2. hours loss
+            # 2. Hourly loss
             hourly_loss_pct = hourly_pnl / current_equity if current_equity > 0 else 0
             if hourly_loss_pct < self.circuit_breakers['hourly_loss_limit']:
                 return {
@@ -5658,20 +5884,20 @@ translatedReason: {reason}
                     'type': 'hourly_loss_circuit_breaker',
                     'current_value': hourly_loss_pct,
                     'limit': self.circuit_breakers['hourly_loss_limit'],
-                    'message': f'hours loss: {hourly_loss_pct:.2%}'
-                }
+                        'message': f'hourly loss limit hit: {hourly_loss_pct:.2%}'
+                    }
             
-            # 3. loss
+            # 3. Consecutive losses
             if self.consecutive_losses >= self.circuit_breakers['consecutive_loss_limit']:
                 return {
                     'triggered': True,
                     'type': 'consecutive_loss_circuit_breaker',
                     'current_value': self.consecutive_losses,
                     'limit': self.circuit_breakers['consecutive_loss_limit'],
-                    'message': f'loss: {self.consecutive_losses}times'
-                }
+                        'message': f'consecutive loss limit hit: {self.consecutive_losses} losses'
+                    }
             
-            # 4. most large drawdown
+            # 4. Maximum drawdown
             max_drawdown = getattr(self, 'current_max_drawdown', 0)
             if max_drawdown < self.circuit_breakers['drawdown_limit']:
                 return {
@@ -5679,25 +5905,25 @@ translatedReason: {reason}
                     'type': 'drawdown_circuit_breaker',
                     'current_value': max_drawdown,
                     'limit': self.circuit_breakers['drawdown_limit'],
-                    'message': f'drawdown: {max_drawdown:.2%}'
-                }
+                        'message': f'drawdown limit hit: {max_drawdown:.2%}'
+                    }
             
-            return {'triggered': False, 'type': None, 'message': 'translated'}
+            return {'triggered': False, 'type': None, 'message': 'no circuit breakers triggered'}
             
         except Exception:
             return {
                 'triggered': True,
                 'type': 'circuit_breaker_error',
-                'message': 'check'
+                'message': 'circuit-breaker check failed'
             }
     
     def check_var_budget_limits(self, pair: str, position_size: float) -> Dict[str, Any]:
-        """VaRcheck"""
+        """Check the proposed position against VaR budgets."""
         try:
-            # calculate new position sizeVaRtranslated
+            # Estimate VaR contribution of the proposed position
             position_var = self.calculate_position_var(pair, position_size)
             
-            # checkVaRtranslated
+            # Project updated daily VaR utilization
             current_daily_var = self.risk_utilization['current_daily_var']
             new_daily_var = current_daily_var + position_var
             
@@ -5714,43 +5940,43 @@ translatedReason: {reason}
                     'adjustment_factor': adjustment_factor,
                     'current_utilization': new_daily_var,
                     'budget_limit': self.risk_budgets['daily_var_budget'],
-                    'message': f'VaRtranslated，position adjustment as{adjustment_factor:.1%}'
+                    'message': f'VaR budget exceeded; reduce position to {adjustment_factor:.1%} of proposed size'
                 }
             
             return {
                 'within_limits': True,
                 'type': 'var_budget_check',
                 'utilization': new_daily_var / self.risk_budgets['daily_var_budget'],
-                'message': 'VaRcheck'
+                'message': 'VaR budget check passed'
             }
             
         except Exception:
             return {
                 'within_limits': False,
                 'adjustment_factor': 0.5,
-                'message': 'VaRcheck，position size'
+                'message': 'VaR budget check failed; applying defensive sizing'
             }
     
     def calculate_position_var(self, pair: str, position_size: float) -> float:
-        """calculate position sizeVaRtranslated"""
+        """Estimate VaR for the proposed position size."""
         try:
             if pair in self.pair_returns_history and len(self.pair_returns_history[pair]) >= 20:
                 returns = self.pair_returns_history[pair]
                 position_var = self.calculate_var(returns) * position_size
                 return min(position_var, self.risk_budgets['position_var_limit'])
             else:
-                # default risk
-                return position_size * 0.02  # translated2%defaultVaR
+                # Default conservative VaR estimate
+                return position_size * 0.02
         except Exception:
-            return position_size * 0.03  # translated
+            return position_size * 0.03
     
     def check_correlation_limits(self, pair: str, position_size: float) -> Dict[str, Any]:
-        """check"""
+        """Check whether the pair breaches portfolio-correlation limits."""
         try:
             current_correlation = self.calculate_portfolio_correlation(pair)
             
             if current_correlation > self.risk_budgets['correlation_limit']:
-                # position size
+                # Scale position size down as correlation increases beyond the limit
                 excess_correlation = current_correlation - self.risk_budgets['correlation_limit']
                 adjustment_factor = max(0.2, 1 - (excess_correlation * 2))
                 
@@ -5760,27 +5986,27 @@ translatedReason: {reason}
                     'adjustment_factor': adjustment_factor,
                     'current_correlation': current_correlation,
                     'limit': self.risk_budgets['correlation_limit'],
-                    'message': f'translated({current_correlation:.1%})，position adjustment as{adjustment_factor:.1%}'
+                    'message': f'Correlation too high ({current_correlation:.1%}); reduce position to {adjustment_factor:.1%} of proposed size'
                 }
             
             return {
                 'within_limits': True,
                 'type': 'correlation_check',
                 'current_correlation': current_correlation,
-                'message': 'check'
+                'message': 'correlation check passed'
             }
             
         except Exception:
             return {
                 'within_limits': False,
                 'adjustment_factor': 0.7,
-                'message': 'check，translated'
+                'message': 'correlation check failed; applying defensive sizing'
             }
     
     def check_concentration_risk(self, pair: str, position_size: float) -> Dict[str, Any]:
-        """mid risk check"""
+        """Check concentration risk for the proposed position."""
         try:
-            # check 1 mid
+            # Current portfolio exposure
             current_positions = getattr(self, 'portfolio_positions', {})
             total_exposure = sum([abs(pos) for pos in current_positions.values()])
             
@@ -5794,7 +6020,7 @@ translatedReason: {reason}
             else:
                 concentration_ratio = 1.0
             
-            max_single_position_ratio = 0.4  # 1 most large40%
+            max_single_position_ratio = 0.4  # max 40% concentration
             
             if concentration_ratio > max_single_position_ratio:
                 adjustment_factor = max_single_position_ratio / concentration_ratio
@@ -5805,27 +6031,27 @@ translatedReason: {reason}
                     'adjustment_factor': adjustment_factor,
                     'concentration_ratio': concentration_ratio,
                     'limit': max_single_position_ratio,
-                    'message': f'mid risk({concentration_ratio:.1%})，position size'
+                    'message': f'concentration too high ({concentration_ratio:.1%}); reduce position size'
                 }
             
             return {
                 'within_limits': True,
                 'type': 'concentration_check',
                 'concentration_ratio': concentration_ratio,
-                'message': 'mid risk check'
+                'message': 'concentration check passed'
             }
             
         except Exception:
             return {
                 'within_limits': False,
                 'adjustment_factor': 0.6,
-                'message': 'mid check，translated'
+                'message': 'concentration check failed; applying defensive sizing'
             }
     
     def check_liquidity_risk(self, pair: str, position_size: float) -> Dict[str, Any]:
-        """risk check"""
+        """Check liquidity and spread risk for the proposed position."""
         try:
-            # get indicator
+            # Current market microstructure snapshot
             market_data = getattr(self, 'current_market_data', {})
             
             if pair in market_data:
@@ -5835,16 +6061,16 @@ translatedReason: {reason}
                 volume_ratio = 1.0  # default value
                 spread = 0.002
             
-            # risk
+            # Liquidity-risk score
             liquidity_risk_score = 0.0
             
-            # volume risk
+            # Volume-based liquidity risk
             if volume_ratio < 0.5:  # volume low
                 liquidity_risk_score += 0.3
             elif volume_ratio < 0.8:
                 liquidity_risk_score += 0.1
             
-            # risk
+            # Spread-based liquidity risk
             if spread > 0.005:  # large
                 liquidity_risk_score += 0.4
             elif spread > 0.003:
@@ -5860,30 +6086,30 @@ translatedReason: {reason}
                     'risk_score': liquidity_risk_score,
                     'volume_ratio': volume_ratio,
                     'spread': spread,
-                    'message': f'risk high({liquidity_risk_score:.1f})，position size'
+                    'message': f'liquidity risk high ({liquidity_risk_score:.1f}); reduce position size'
                 }
             
             return {
                 'sufficient_liquidity': True,
                 'type': 'liquidity_check',
                 'risk_score': liquidity_risk_score,
-                'message': 'risk check'
+                'message': 'liquidity check passed'
             }
             
         except Exception:
             return {
                 'sufficient_liquidity': False,
                 'adjustment_factor': 0.5,
-                'message': 'check，translated'
+                'message': 'liquidity check failed; applying defensive sizing'
             }
     
     def check_leverage_risk(self, pair: str, proposed_leverage: int) -> Dict[str, Any]:
         """leverage risk check"""
         try:
-            # market state volatility leverage
+            # Market-volatility-based leverage cap
             market_volatility = getattr(self, 'current_market_volatility', {}).get(pair, 0.02)
             
-            # leverage
+            # Determine max allowed leverage from volatility
             if market_volatility > 0.05:  # high volatility
                 max_allowed_leverage = min(5, self.leverage_multiplier)
             elif market_volatility > 0.03:  # mid
@@ -5898,33 +6124,33 @@ translatedReason: {reason}
                     'max_allowed_leverage': max_allowed_leverage,
                     'proposed_leverage': proposed_leverage,
                     'market_volatility': market_volatility,
-                    'message': f'leverage risk high，as{max_allowed_leverage}translated'
+                    'message': f'leverage too high; cap reduced to {max_allowed_leverage}x'
                 }
             
             return {
                 'within_limits': True,
                 'type': 'leverage_check',
                 'approved_leverage': proposed_leverage,
-                'message': 'leverage risk check'
+                'message': 'leverage check passed'
             }
             
         except Exception:
             return {
                 'within_limits': False,
                 'max_allowed_leverage': min(3, proposed_leverage),
-                'message': 'leverage check，translated'
+                'message': 'leverage check failed; applying defensive cap'
             }
     
     def check_time_based_risk(self, current_time: datetime) -> Dict[str, Any]:
-        """time risk check"""
+        """Check for elevated risk based on time-of-day and day-of-week."""
         try:
             hour = current_time.hour
             weekday = current_time.weekday()
             
             high_risk_periods = [
-                (weekday >= 5),  # translated
-                (hour <= 6 or hour >= 22),  # translated
-                (11 <= hour <= 13),  # translated
+                (weekday >= 5),  # weekends
+                (hour <= 6 or hour >= 22),  # thin-liquidity hours
+                (11 <= hour <= 13),  # midday lull / transition period
             ]
             
             if any(high_risk_periods):
@@ -5936,25 +6162,25 @@ translatedReason: {reason}
                     'adjustment_factor': adjustment_factor,
                     'hour': hour,
                     'weekday': weekday,
-                    'message': 'high risk，position size'
+                    'message': 'high-risk time window; reduce position size'
                 }
             
             return {
                 'high_risk_period': False,
                 'type': 'time_check',
                 'adjustment_factor': 1.0,
-                'message': 'time risk check'
+                'message': 'time-based risk check passed'
             }
             
         except Exception:
             return {
                 'high_risk_period': True,
                 'adjustment_factor': 0.8,
-                'message': 'time check，translated'
+                'message': 'time-based risk check failed; applying defensive sizing'
             }
     
     def record_risk_event(self, event_type: str, event_data: Dict[str, Any]):
-        """record risk"""
+        """Record a risk event for later review."""
         try:
             risk_event = {
                 'timestamp': datetime.now(timezone.utc),
@@ -5973,7 +6199,7 @@ translatedReason: {reason}
             pass
     
     def determine_event_severity(self, event_data: Dict[str, Any]) -> str:
-        """translated"""
+        """Classify the severity of a recorded risk event."""
         try:
             if not event_data.get('approved', True):
                 return 'critical'
@@ -5991,7 +6217,7 @@ translatedReason: {reason}
             return 'unknown'
     
     def emergency_risk_shutdown(self, reason: str):
-        """translated"""
+        """Activate emergency risk shutdown mode."""
         try:
             self.emergency_mode = True
             self.circuit_breaker_active = True
@@ -6006,14 +6232,13 @@ translatedReason: {reason}
             
             self.emergency_actions.append(emergency_action)
             
-            # translated
-            # record
+            # Reserved for external alerting/logging hooks
             
         except Exception:
             pass
     
     def get_risk_control_status(self) -> Dict[str, Any]:
-        """get"""
+        """Return the current risk-control status snapshot."""
         try:
             return {
                 'risk_control_enabled': self.risk_control_enabled,
@@ -6026,36 +6251,36 @@ translatedReason: {reason}
                 'last_risk_check': self.last_risk_check_time
             }
         except Exception:
-            return {'error': 'none get'}
+            return {'error': 'unable to fetch risk-control status'}
     
-    # ===== and =====
+    # ===== Execution system =====
     
     def initialize_execution_system(self):
-        """initialize"""
-        # configuration
+        """Initialize the smart execution subsystem."""
+        # Execution algorithm weights
         self.execution_algorithms = {
             'twap': {'enabled': True, 'weight': 0.3},      # time price
             'vwap': {'enabled': True, 'weight': 0.4},      # volume price
             'implementation_shortfall': {'enabled': True, 'weight': 0.3}  # most small
         }
         
-        # translated
+        # Slippage-control settings
         self.slippage_control = {
-            'max_allowed_slippage': 0.002,    # most large allow0.2%
-            'slippage_prediction_window': 50,  # translated
-            'adaptive_threshold': 0.001,      # value0.1%
-            'emergency_threshold': 0.005      # value0.5%
+            'max_allowed_slippage': 0.002,     # max allowed slippage: 0.2%
+            'slippage_prediction_window': 50,  # lookback window
+            'adaptive_threshold': 0.001,       # adaptive threshold: 0.1%
+            'emergency_threshold': 0.005       # emergency threshold: 0.5%
         }
         
-        # translated
+        # Order-splitting settings
         self.order_splitting = {
-            'min_split_size': 0.01,           # most small large small1%
-            'max_split_count': 10,            # most large
-            'split_interval_seconds': 30,     # translated30translated
-            'adaptive_splitting': True        # translated
+            'min_split_size': 0.01,            # minimum split threshold: 1%
+            'max_split_count': 10,
+            'split_interval_seconds': 30,      # 30 seconds
+            'adaptive_splitting': True
         }
         
-        # translated
+        # Execution-performance metrics
         self.execution_metrics = {
             'realized_slippage': [],
             'market_impact': [],
@@ -6064,21 +6289,21 @@ translatedReason: {reason}
             'cost_basis_deviation': []
         }
         
-        # translated
+        # Simple market-impact model coefficients
         self.market_impact_model = {
-            'temporary_impact_factor': 0.5,   # translated
-            'permanent_impact_factor': 0.3,   # translated
-            'nonlinear_factor': 1.5,          # translated
-            'decay_factor': 0.1               # translated
+            'temporary_impact_factor': 0.5,
+            'permanent_impact_factor': 0.3,
+            'nonlinear_factor': 1.5,
+            'decay_factor': 0.1
         }
         
-        # translated
+        # Execution tracking
         self.active_executions = {}
         self.execution_history = []
         
     def smart_order_execution(self, pair: str, order_size: float, order_side: str, 
                             current_price: float, market_conditions: Dict[str, Any]) -> Dict[str, Any]:
-        """translated"""
+        """Build a smart execution plan for a proposed order."""
         
         execution_plan = {
             'original_size': order_size,
@@ -6090,67 +6315,67 @@ translatedReason: {reason}
         }
         
         try:
-            # 1. risk
+            # 1. Execution-risk assessment
             execution_risk = self.assess_execution_risk(pair, order_size, market_conditions)
             execution_plan['risk_level'] = execution_risk['level']
             
-            # 2. translated
+            # 2. Slippage prediction
             predicted_slippage = self.predict_slippage(pair, order_size, order_side, market_conditions)
             execution_plan['expected_slippage'] = predicted_slippage
             
-            # 3. translated
+            # 3. Execution-algorithm selection
             optimal_algorithm = self.select_execution_algorithm(pair, order_size, market_conditions, execution_risk)
             execution_plan['execution_strategy'] = optimal_algorithm
             
-            # 4. optimize
+            # 4. Optional order splitting
             if order_size > self.order_splitting['min_split_size'] and execution_risk['level'] != 'low':
                 split_plan = self.optimize_order_splitting(pair, order_size, market_conditions, optimal_algorithm)
                 execution_plan['split_orders'] = split_plan['orders']
                 execution_plan['estimated_execution_time'] = split_plan['total_time']
             else:
                 execution_plan['split_orders'] = [{'size': order_size, 'delay': 0, 'priority': 'high'}]
-                execution_plan['estimated_execution_time'] = 30  # translated30translated
+                execution_plan['estimated_execution_time'] = 30
             
-            # 5. optimize
+            # 5. Timing optimization
             execution_timing = self.optimize_execution_timing(pair, market_conditions)
             execution_plan['optimal_timing'] = execution_timing
             
-            # 6. translated
+            # 6. Execution instructions
             execution_instructions = self.generate_execution_instructions(execution_plan, pair, order_side, current_price)
             execution_plan['instructions'] = execution_instructions
             
             return execution_plan
             
         except Exception as e:
-            # to
+            # Fallback immediate-execution plan
             return {
                 'original_size': order_size,
                 'execution_strategy': 'immediate',
                 'split_orders': [{'size': order_size, 'delay': 0, 'priority': 'high'}],
-                'expected_slippage': 0.002,  # translated
+                'expected_slippage': 0.002,
                 'estimated_execution_time': 30,
                 'risk_level': 'unknown',
                 'error': str(e)
             }
     
     def assess_execution_risk(self, pair: str, order_size: float, market_conditions: Dict[str, Any]) -> Dict[str, Any]:
-        """risk"""
+        """Assess execution risk from size, volatility, and spread."""
         try:
             risk_score = 0.0
             risk_factors = []
             
-            # 1. large small risk
+            # 1. Order-size risk relative to average volume
             avg_volume = market_conditions.get('avg_volume', 1.0)
             order_volume_ratio = order_size / avg_volume if avg_volume > 0 else 1.0
             
-            if order_volume_ratio > 0.1:  # translated10%volume
+            if order_volume_ratio > 0.1:  # >10% of average volume
                 risk_score += 0.4
                 risk_factors.append('large_order_size')
             elif order_volume_ratio > 0.05:
                 risk_score += 0.2
                 risk_factors.append('medium_order_size')
             
-            # 2. risk
+            # 2. Volatility risk
             volatility = market_conditions.get('volatility', 0.02)
             if volatility > 0.05:
                 risk_score += 0.3
@@ -6159,18 +6384,18 @@ translatedReason: {reason}
                 risk_score += 0.15
                 risk_factors.append('medium_volatility')
             
-            # 3. risk
+            # 3. Spread risk
             bid_ask_spread = market_conditions.get('spread', 0.001)
             if bid_ask_spread > 0.003:
                 risk_score += 0.2
                 risk_factors.append('wide_spread')
             
-            # 4. time risk
+            # 4. Session risk
             if self.is_high_volatility_session(datetime.now(timezone.utc)):
                 risk_score += 0.1
                 risk_factors.append('high_volatility_session')
             
-            # risk level
+            # Risk-level classification
             if risk_score < 0.3:
                 risk_level = 'low'
             elif risk_score < 0.6:
@@ -6195,22 +6420,22 @@ translatedReason: {reason}
     
     def predict_slippage(self, pair: str, order_size: float, order_side: str, 
                         market_conditions: Dict[str, Any]) -> float:
-        """translated"""
+        """Predict expected slippage for an order."""
         try:
-            # translated
-            base_slippage = market_conditions.get('spread', 0.001) / 2  # count
+            # Base slippage from half-spread
+            base_slippage = market_conditions.get('spread', 0.001) / 2
             
-            # translated
+            # Order size relative to average volume
             avg_volume = market_conditions.get('avg_volume', 1.0)
             volume_ratio = order_size / avg_volume if avg_volume > 0 else 0.1
             
-            # translated
+            # Temporary impact
             temporary_impact = (
                 self.market_impact_model['temporary_impact_factor'] * 
                 (volume_ratio ** self.market_impact_model['nonlinear_factor'])
             )
             
-            # translated
+            # Permanent impact
             permanent_impact = (
                 self.market_impact_model['permanent_impact_factor'] * 
                 (volume_ratio ** 0.5)
@@ -6220,32 +6445,32 @@ translatedReason: {reason}
             volatility = market_conditions.get('volatility', 0.02)
             volatility_adjustment = min(1.0, volatility * 10)  # volatility high large
             
-            # time
+            # Session adjustment
             time_adjustment = 1.0
             if self.is_high_volatility_session(datetime.now(timezone.utc)):
                 time_adjustment = 1.2
             elif self.is_low_liquidity_session(datetime.now(timezone.utc)):
                 time_adjustment = 1.3
             
-            # translated
+            # Historical realized-slippage adjustment
             historical_slippage = self.get_historical_slippage(pair)
             historical_adjustment = max(0.5, min(2.0, historical_slippage / 0.001))
             
-            # translated
+            # Final predicted slippage
             predicted_slippage = (
                 base_slippage + temporary_impact + permanent_impact
             ) * volatility_adjustment * time_adjustment * historical_adjustment
             
-            # at range
+            # Cap at the emergency threshold
             predicted_slippage = min(predicted_slippage, self.slippage_control['emergency_threshold'])
             
-            return max(0.0001, predicted_slippage)  # most small0.01%
+            return max(0.0001, predicted_slippage)  # floor at 0.01%
             
         except Exception:
-            return 0.002  # translated0.2%
+            return 0.002
     
     def get_historical_slippage(self, pair: str) -> float:
-        """get"""
+        """Return recent realized slippage for the pair."""
         try:
             if len(self.execution_metrics['realized_slippage']) > 0:
                 recent_slippage = self.execution_metrics['realized_slippage'][-20:]  # most20times
@@ -6258,27 +6483,27 @@ translatedReason: {reason}
     def select_execution_algorithm(self, pair: str, order_size: float, 
                                  market_conditions: Dict[str, Any], 
                                  execution_risk: Dict[str, Any]) -> str:
-        """most"""
+        """Select the preferred execution algorithm."""
         try:
             algorithm_scores = {}
             
-            # TWAPscore
+            # TWAP score
             if self.execution_algorithms['twap']['enabled']:
-                twap_score = 0.5  # translated
+                twap_score = 0.5
                 
                 # time low
                 if execution_risk['level'] == 'low':
                     twap_score += 0.2
                 
-                # translated
+                # TWAP works better in lower-volatility conditions
                 if market_conditions.get('volatility', 0.02) < 0.025:
                     twap_score += 0.1
                 
                 algorithm_scores['twap'] = twap_score * self.execution_algorithms['twap']['weight']
             
-            # VWAPscore
+            # VWAP score
             if self.execution_algorithms['vwap']['enabled']:
-                vwap_score = 0.6  # translated
+                vwap_score = 0.6
                 
                 # volume
                 if market_conditions.get('volume_ratio', 1.0) > 1.0:
@@ -6290,9 +6515,9 @@ translatedReason: {reason}
                 
                 algorithm_scores['vwap'] = vwap_score * self.execution_algorithms['vwap']['weight']
             
-            # Implementation Shortfallscore
+            # Implementation Shortfall score
             if self.execution_algorithms['implementation_shortfall']['enabled']:
-                is_score = 0.4  # translated
+                is_score = 0.4
                 
                 # high risk
                 if execution_risk['level'] == 'high':
@@ -6308,7 +6533,7 @@ translatedReason: {reason}
                 
                 algorithm_scores['implementation_shortfall'] = is_score * self.execution_algorithms['implementation_shortfall']['weight']
             
-            # most high
+            # Choose the best-scoring algorithm
             if algorithm_scores:
                 optimal_algorithm = max(algorithm_scores.items(), key=lambda x: x[1])[0]
                 return optimal_algorithm
@@ -6316,12 +6541,12 @@ translatedReason: {reason}
                 return 'twap'  # default
                 
         except Exception:
-            return 'twap'  # toTWAP
+                return 'twap'
     
     def optimize_order_splitting(self, pair: str, order_size: float, 
                                market_conditions: Dict[str, Any], 
                                algorithm: str) -> Dict[str, Any]:
-        """optimize"""
+        """Build an order-splitting plan for the selected execution algorithm."""
         try:
             split_plan = {
                 'orders': [],
@@ -6329,7 +6554,7 @@ translatedReason: {reason}
                 'expected_total_slippage': 0.0
             }
             
-            # translated
+            # Order size relative to average volume
             avg_volume = market_conditions.get('avg_volume', 1.0)
             volume_ratio = order_size / avg_volume if avg_volume > 0 else 0.1
             
@@ -6340,16 +6565,16 @@ translatedReason: {reason}
             elif volume_ratio > 0.05:  # mid
                 split_count = min(self.order_splitting['max_split_count'], 3)
             else:
-                split_count = 1  # small not
+                split_count = 1
             
             if split_count == 1:
                 split_plan['orders'] = [{'size': order_size, 'delay': 0, 'priority': 'high'}]
                 split_plan['total_time'] = 30
                 return split_plan
             
-            # translated
+            # Algorithm-specific split logic
             if algorithm == 'twap':
-                # time
+                # Time-weighted schedule
                 sub_order_size = order_size / split_count
                 base_delay = self.order_splitting['split_interval_seconds']
                 
@@ -6363,7 +6588,7 @@ translatedReason: {reason}
                 split_plan['total_time'] = (split_count - 1) * base_delay + 30
                 
             elif algorithm == 'vwap':
-                # volume
+                # Volume-weighted schedule
                 volume_distribution = self.get_volume_distribution_forecast()
                 cumulative_size = 0
                 
@@ -6377,7 +6602,7 @@ translatedReason: {reason}
                         'priority': 'high' if volume_weight > 0.2 else 'medium'
                     })
                 
-                # translated
+                # Make sure the full order size is allocated
                 if cumulative_size < order_size:
                     remaining = order_size - cumulative_size
                     split_plan['orders'][-1]['size'] += remaining
@@ -6385,17 +6610,17 @@ translatedReason: {reason}
                 split_plan['total_time'] = len(split_plan['orders']) * 60
                 
             else:  # implementation_shortfall
-                # translated，translated
+                # Front-load execution based on urgency
                 remaining_size = order_size
                 time_offset = 0
                 urgency_factor = min(1.5, market_conditions.get('volatility', 0.02) * 20)
                 
                 for i in range(split_count):
                     if i == split_count - 1:
-                        # most after 1 count has
+                        # Final child order takes the remainder
                         sub_order_size = remaining_size
                     else:
-                        # large small
+                        # Allocate dynamically by urgency
                         base_portion = 1.0 / (split_count - i)
                         urgency_adjustment = base_portion * urgency_factor
                         sub_order_size = min(remaining_size, order_size * urgency_adjustment)
@@ -6407,14 +6632,14 @@ translatedReason: {reason}
                     })
                     
                     remaining_size -= sub_order_size
-                    time_offset += max(15, int(45 / urgency_factor))  # translated
+                    time_offset += max(15, int(45 / urgency_factor))
                     
                     if remaining_size <= 0:
                         break
                 
                 split_plan['total_time'] = time_offset + 30
             
-            # calculate
+            # Expected blended slippage across child orders
             total_slippage = 0.0
             for order in split_plan['orders']:
                 sub_slippage = self.predict_slippage(pair, order['size'], 'buy', market_conditions)
@@ -6432,28 +6657,27 @@ translatedReason: {reason}
             }
     
     def get_volume_distribution_forecast(self) -> List[float]:
-        """get volume"""
+        """Return a placeholder forecast for volume distribution."""
         try:
-            # simplified day volume
-            # translated
+            # Simplified intraday volume profile
             typical_distribution = [
                 0.05, 0.08, 0.12, 0.15, 0.18, 0.15, 0.12, 0.08, 0.05, 0.02
             ]
             return typical_distribution
         except Exception:
-            return [0.1] * 10  # translated
+            return [0.1] * 10
     
     def optimize_execution_timing(self, pair: str, market_conditions: Dict[str, Any]) -> Dict[str, Any]:
-        """optimize"""
+        """Estimate whether immediate or delayed execution is preferable."""
         try:
             current_time = datetime.now(timezone.utc)
             hour = current_time.hour
             
-            timing_score = 0.5  # translated
+            timing_score = 0.5
             timing_factors = []
             
-            # score
-            if 13 <= hour <= 16:  # translated
+            # Session-liquidity score
+            if 13 <= hour <= 16:
                 timing_score += 0.3
                 timing_factors.append('high_liquidity_session')
             elif 8 <= hour <= 11 or 17 <= hour <= 20:  # 1
@@ -6481,7 +6705,7 @@ translatedReason: {reason}
                 timing_score -= 0.1
                 timing_factors.append('low_volume')
             
-            # translated
+            # Timing recommendation
             if timing_score > 0.7:
                 recommendation = 'execute_immediately'
             elif timing_score > 0.4:
@@ -6507,7 +6731,7 @@ translatedReason: {reason}
     def generate_execution_instructions(self, execution_plan: Dict[str, Any], 
                                       pair: str, order_side: str, 
                                       current_price: float) -> List[Dict[str, Any]]:
-        """translated"""
+        """Generate executable child-order instructions from the execution plan."""
         try:
             instructions = []
             
@@ -6532,7 +6756,7 @@ translatedReason: {reason}
             return instructions
             
         except Exception:
-            # translated
+            # Fallback to a simple immediate market order instruction
             return [{
                 'instruction_id': f"{pair}_{order_side}_simple_{int(datetime.now(timezone.utc).timestamp())}",
                 'pair': pair,
@@ -6547,25 +6771,25 @@ translatedReason: {reason}
             }]
     
     def determine_order_type(self, order: Dict[str, Any], execution_plan: Dict[str, Any]) -> str:
-        """translated"""
+        """Choose the order type for a child order."""
         try:
             if order['priority'] == 'high' or execution_plan.get('risk_level') == 'high':
                 return 'market'
             elif execution_plan['expected_slippage'] < self.slippage_control['adaptive_threshold']:
                 return 'limit'
             else:
-                return 'market_with_protection'  # translated
+                return 'market_with_protection'
         except Exception:
             return 'market'
     
     def calculate_price_limit(self, current_price: float, side: str, 
                             order_size: float, execution_plan: Dict[str, Any]) -> float:
-        """calculate price"""
+        """Calculate a protected limit price from expected slippage."""
         try:
             expected_slippage = execution_plan['expected_slippage']
             
-            # translated
-            slippage_buffer = expected_slippage * 1.2  # 20%translated
+            # Add a 20% buffer over expected slippage
+            slippage_buffer = expected_slippage * 1.2
             
             if side.lower() == 'buy':
                 return current_price * (1 + slippage_buffer)
@@ -6573,16 +6797,16 @@ translatedReason: {reason}
                 return current_price * (1 - slippage_buffer)
                 
         except Exception:
-            # price
+            # Simple fallback limit
             if side.lower() == 'buy':
                 return current_price * 1.005
             else:
                 return current_price * 0.995
     
     def track_execution_performance(self, execution_id: str, execution_result: Dict[str, Any]):
-        """translated"""
+        """Track realized execution quality metrics."""
         try:
-            # calculate
+            # Realized slippage
             expected_price = execution_result.get('expected_price', 0)
             actual_price = execution_result.get('actual_price', 0)
             
@@ -6590,7 +6814,7 @@ translatedReason: {reason}
                 realized_slippage = abs(actual_price - expected_price) / expected_price
                 self.execution_metrics['realized_slippage'].append(realized_slippage)
             
-            # calculate
+            # Market impact
             pre_trade_price = execution_result.get('pre_trade_price', 0)
             post_trade_price = execution_result.get('post_trade_price', 0)
             
@@ -6598,7 +6822,7 @@ translatedReason: {reason}
                 market_impact = abs(post_trade_price - pre_trade_price) / pre_trade_price
                 self.execution_metrics['market_impact'].append(market_impact)
             
-            # record indicator
+            # Execution time
             execution_time = execution_result.get('execution_time_seconds', 0)
             if execution_time > 0:
                 self.execution_metrics['execution_time'].append(execution_time)
@@ -6606,7 +6830,7 @@ translatedReason: {reason}
             fill_ratio = execution_result.get('fill_ratio', 1.0)
             self.execution_metrics['fill_ratio'].append(fill_ratio)
             
-            # indicator long
+            # Trim long histories
             for metric in self.execution_metrics.values():
                 if len(metric) > 500:
                     metric[:] = metric[-250:]  # most250count record
@@ -6615,14 +6839,14 @@ translatedReason: {reason}
             pass
     
     def get_execution_quality_report(self) -> Dict[str, Any]:
-        """get"""
+        """Return summary statistics for execution quality."""
         try:
             if not any(self.execution_metrics.values()):
-                return {'error': 'none'}
+                return {'error': 'no execution metrics available'}
             
             report = {}
             
-            # translated
+            # Slippage stats
             if self.execution_metrics['realized_slippage']:
                 slippage_data = self.execution_metrics['realized_slippage']
                 report['slippage'] = {
@@ -6633,7 +6857,7 @@ translatedReason: {reason}
                     'samples': len(slippage_data)
                 }
             
-            # translated
+            # Market-impact stats
             if self.execution_metrics['market_impact']:
                 impact_data = self.execution_metrics['market_impact']
                 report['market_impact'] = {
@@ -6654,7 +6878,7 @@ translatedReason: {reason}
                     'samples': len(time_data)
                 }
             
-            # translated
+            # Fill-ratio stats
             if self.execution_metrics['fill_ratio']:
                 fill_data = self.execution_metrics['fill_ratio']
                 report['fill_ratio'] = {
@@ -6667,12 +6891,12 @@ translatedReason: {reason}
             return report
             
         except Exception:
-            return {'error': 'none'}
+            return {'error': 'execution quality report unavailable'}
     
-    # ===== and =====
+    # ===== Sentiment system =====
     
     def initialize_sentiment_system(self):
-        """initialize"""
+        """Initialize the placeholder sentiment-analysis subsystem."""
         # market sentiment indicator configuration
         self.sentiment_indicators = {
             'fear_greed_index': {'enabled': True, 'weight': 0.25},
@@ -6683,13 +6907,13 @@ translatedReason: {reason}
             'intermarket_sentiment': {'enabled': True, 'weight': 0.15}
         }
         
-        # value
+        # Sentiment thresholds
         self.sentiment_thresholds = {
-            'extreme_fear': 20,      # translated
-            'fear': 35,              # translated
+            'extreme_fear': 20,
+            'fear': 35,
             'neutral': 50,           # mid
-            'greed': 65,             # translated
-            'extreme_greed': 80      # translated
+            'greed': 65,
+            'extreme_greed': 80
         }
         
         # configuration
@@ -6701,29 +6925,30 @@ translatedReason: {reason}
             'intermarket_correlations': {'enabled': True, 'correlation_threshold': 0.6}
         }
         
-        # translated
+        # Sentiment history
         self.sentiment_history = {
             'composite_sentiment': [],
+            'sentiment_state': [],
             'market_regime': [],
             'sentiment_extremes': [],
             'contrarian_signals': []
         }
         
-        # translated
+        # External-event placeholders
         self.external_events = []
         self.event_impact_history = []
         
-        # translated
+        # Placeholder seasonal/intermarket data
         self.seasonal_patterns = {}
         self.intermarket_data = {}
         
-    # translated analyze_market_sentiment - simplified
+    # Simplified aggregate sentiment analysis
     def analyze_market_sentiment(self) -> Dict[str, Any]:
-        """translated"""
+        """Build a composite sentiment snapshot from the enabled components."""
         try:
             sentiment_components = {}
             
-            # 1. translated
+            # 1. Fear/greed proxy
             if self.sentiment_indicators['fear_greed_index']['enabled']:
                 fear_greed = self.calculate_fear_greed_index()
                 sentiment_components['fear_greed'] = fear_greed
@@ -6733,33 +6958,33 @@ translatedReason: {reason}
                 vix_sentiment = self.analyze_volatility_sentiment()
                 sentiment_components['volatility_sentiment'] = vix_sentiment
             
-            # 3. new
+            # 3. News sentiment
             if self.sentiment_indicators['news_sentiment']['enabled']:
                 news_sentiment = self.analyze_news_sentiment()
                 sentiment_components['news_sentiment'] = news_sentiment
             
-            # 4. translated
+            # 4. Social sentiment
             if self.sentiment_indicators['social_sentiment']['enabled']:
                 social_sentiment = self.analyze_social_sentiment()
                 sentiment_components['social_sentiment'] = social_sentiment
             
-            # 5. translated
+            # 5. Positioning sentiment
             if self.sentiment_indicators['positioning_data']['enabled']:
                 positioning_sentiment = self.analyze_positioning_data()
                 sentiment_components['positioning_sentiment'] = positioning_sentiment
             
-            # 6. translated
+            # 6. Intermarket sentiment
             if self.sentiment_indicators['intermarket_sentiment']['enabled']:
                 intermarket_sentiment = self.analyze_intermarket_sentiment()
                 sentiment_components['intermarket_sentiment'] = intermarket_sentiment
             
-            # calculate
+            # Composite sentiment score
             composite_sentiment = self.calculate_composite_sentiment(sentiment_components)
             
-            # translated
+            # Qualitative sentiment state
             sentiment_state = self.determine_sentiment_state(composite_sentiment)
             
-            # signal
+            # Trading adjustments
             sentiment_adjustment = self.generate_sentiment_adjustment(sentiment_state, sentiment_components)
             
             sentiment_analysis = {
@@ -6771,21 +6996,21 @@ translatedReason: {reason}
                 'timestamp': datetime.now(timezone.utc)
             }
             
-            # update
+            # Update sentiment history
             self.update_sentiment_history(sentiment_analysis)
             
             return sentiment_analysis
             
         except Exception as e:
             return {
-                'composite_sentiment': 50,  # mid
+                'composite_sentiment': 50,
                 'sentiment_state': 'neutral',
-                'error': f'translated: {str(e)}',
+                'error': f'Sentiment analysis failed: {str(e)}',
                 'timestamp': datetime.now(timezone.utc)
             }
     
     def calculate_fear_greed_index(self) -> Dict[str, Any]:
-        """calculate"""
+        """Calculate a placeholder fear/greed index from internal proxies."""
         try:
             components = {}
             
@@ -6797,19 +7022,19 @@ translatedReason: {reason}
             volatility_fear = self.calculate_volatility_fear()
             components['volatility_fear'] = volatility_fear
             
-            # translated (15%) - up down
+            # Market breadth (15%)
             market_breadth = self.calculate_market_breadth_sentiment()
             components['market_breadth'] = market_breadth
             
-            # translated (15%) - translated
+            # Safe-haven demand (15%)
             safe_haven_demand = self.calculate_safe_haven_sentiment()
             components['safe_haven_demand'] = safe_haven_demand
             
-            # translated (10%) - risk indicator  
+            # Junk-bond demand (10%)
             junk_bond_demand = self.calculate_junk_bond_sentiment()
             components['junk_bond_demand'] = junk_bond_demand
             
-            # translated (10%)
+            # Put/call ratio (10%)
             put_call_ratio = self.calculate_put_call_sentiment()
             components['put_call_ratio'] = put_call_ratio
             
@@ -6834,15 +7059,13 @@ translatedReason: {reason}
             }
     
     def calculate_price_momentum_sentiment(self) -> float:
-        """calculate price momentum"""
+        """Calculate a placeholder price-momentum sentiment score."""
         try:
-            # price calculate
-            # simplified：price
+            # Simplified placeholder breadth proxy
             
-            # translated125day up
-            stocks_above_ma125 = 0.6  # 60%at125day up
+            stocks_above_ma125 = 0.6  # 60% above the 125-day average
             
-            # as0-100value
+            # Convert to a 0-100 score
             momentum_sentiment = stocks_above_ma125 * 100
             
             return min(100, max(0, momentum_sentiment))
@@ -6851,19 +7074,19 @@ translatedReason: {reason}
             return 50
     
     def calculate_volatility_fear(self) -> float:
-        """calculate volatility"""
+        """Calculate a placeholder volatility-based fear score."""
         try:
-            # before volatility value
+            # Average current market volatility
             current_volatility = getattr(self, 'current_market_volatility', {})
             avg_vol = sum(current_volatility.values()) / len(current_volatility) if current_volatility else 0.02
             
-            # volatility（value）
+            # Historical anchor value
             historical_avg_vol = 0.025
             
-            # volatility
+            # Relative volatility
             vol_ratio = avg_vol / historical_avg_vol if historical_avg_vol > 0 else 1.0
             
-            # as（volatility high，large，low）
+            # Higher volatility maps to lower sentiment
             volatility_fear = max(0, min(100, 100 - (vol_ratio - 1) * 50))
             
             return volatility_fear
@@ -6872,15 +7095,13 @@ translatedReason: {reason}
             return 50
     
     def calculate_market_breadth_sentiment(self) -> float:
-        """calculate"""
+        """Calculate a placeholder market-breadth sentiment score."""
         try:
-            # translated
-            # up down
+            # Simplified advance/decline ratio placeholder
             
-            # translated：up
-            advancing_stocks_ratio = 0.55  # 55%up
+            advancing_stocks_ratio = 0.55  # 55% advancing
             
-            # as
+            # Convert to a score
             breadth_sentiment = advancing_stocks_ratio * 100
             
             return min(100, max(0, breadth_sentiment))
@@ -6889,15 +7110,13 @@ translatedReason: {reason}
             return 50
     
     def calculate_safe_haven_sentiment(self) -> float:
-        """calculate"""
+        """Calculate a placeholder safe-haven-demand sentiment score."""
         try:
-            # translated
-            # translated、translated
+            # Placeholder safe-haven proxy performance
             
-            # translated（value high）
-            safe_haven_performance = -0.02  # -2%translated
+            safe_haven_performance = -0.02  # -2%
             
-            # as（high，low）
+            # Better risky-asset sentiment when safe havens underperform
             safe_haven_sentiment = max(0, min(100, 50 - safe_haven_performance * 1000))
             
             return safe_haven_sentiment
@@ -6906,16 +7125,14 @@ translatedReason: {reason}
             return 50
     
     def calculate_junk_bond_sentiment(self) -> float:
-        """calculate"""
+        """Calculate a placeholder junk-bond sentiment score."""
         try:
-            # and
-            # high
+            # Placeholder credit-spread inputs
             
-            # translated（bp）
-            credit_spread_bp = 350  # 350count
-            historical_avg_spread = 400  # translated400bp
+            credit_spread_bp = 350
+            historical_avg_spread = 400  # basis points
             
-            # as
+            # Tighter spreads imply more risk appetite
             spread_ratio = credit_spread_bp / historical_avg_spread
             junk_bond_sentiment = max(0, min(100, 100 - (spread_ratio - 1) * 100))
             
@@ -6925,16 +7142,14 @@ translatedReason: {reason}
             return 50
     
     def calculate_put_call_sentiment(self) -> float:
-        """calculate"""
+        """Calculate a placeholder put/call-ratio sentiment score."""
         try:
-            # translated/translated
-            # translated
+            # Placeholder options sentiment input
             
-            # translated/translated
-            put_call_ratio = 0.8  # 0.8translated
+            put_call_ratio = 0.8
             historical_avg_ratio = 1.0
             
-            # as（low，high）
+            # Lower put/call ratios imply less fear
             put_call_sentiment = max(0, min(100, 100 - (put_call_ratio / historical_avg_ratio - 1) * 100))
             
             return put_call_sentiment
@@ -6943,7 +7158,7 @@ translatedReason: {reason}
             return 50
     
     def interpret_fear_greed_index(self, index_value: float) -> str:
-        """translated"""
+        """Map the fear/greed index to a qualitative state."""
         if index_value <= self.sentiment_thresholds['extreme_fear']:
             return 'extreme_fear'
         elif index_value <= self.sentiment_thresholds['fear']:
@@ -6957,9 +7172,9 @@ translatedReason: {reason}
         else:
             return 'extreme_greed'
     
-    # translated analyze_volatility_sentiment - simplified
+    # Simplified volatility sentiment analysis
     def analyze_volatility_sentiment(self) -> Dict[str, Any]:
-        """volatility"""
+        """Analyze a simple volatility-based sentiment regime."""
         try:
             current_volatility = getattr(self, 'current_market_volatility', {})
             
@@ -6972,10 +7187,10 @@ translatedReason: {reason}
             
             avg_vol = sum(current_volatility.values()) / len(current_volatility)
             
-            # volatility（simplified calculate）
+            # Simplified percentile estimate
             vol_percentile = min(95, max(5, avg_vol * 2000))  # simplified
             
-            # signal
+            # Volatility regime classification
             if vol_percentile > 80:
                 sentiment_signal = 'high_fear'
                 volatility_level = 'high'
@@ -7003,27 +7218,24 @@ translatedReason: {reason}
                 'volatility_percentile': 50
             }
     
-    # translated analyze_news_sentiment - simplified
+    # Simplified news sentiment placeholder
     def analyze_news_sentiment(self) -> Dict[str, Any]:
-        """new"""
+        """Return a placeholder news-sentiment snapshot."""
         try:
-            # new
-            # newAPItranslatedNLPtranslated
+            # Placeholder output until a real external news feed is wired in
             
-            # new (-1to1)
-            news_sentiment_score = 0.1  # translated
+            news_sentiment_score = 0.1
             
-            # new
-            news_volume = 1.2  # 120%new
+            news_volume = 1.2  # 120% of baseline volume
             
-            # translated
+            # Placeholder keyword buckets
             sentiment_keywords = {
                 'positive': ['growth', 'opportunity', 'bullish'],
                 'negative': ['uncertainty', 'risk', 'volatile'],
                 'neutral': ['stable', 'unchanged', 'maintain']
             }
             
-            # as signal
+            # Convert score into a directional signal
             if news_sentiment_score > 0.3:
                 trading_signal = 'bullish'
             elif news_sentiment_score < -0.3:
@@ -7047,37 +7259,34 @@ translatedReason: {reason}
                 'confidence_level': 0.5
             }
     
-    # translated analyze_social_sentiment - simplified
+    # Simplified social sentiment placeholder
     def analyze_social_sentiment(self) -> Dict[str, Any]:
-        """translated"""
+        """Return a placeholder social-sentiment snapshot."""
         try:
-            # translated
-            # translatedTwitter/ReddittranslatedAPI
+            # Placeholder social-data aggregation
             
-            # and
-            mention_volume = 1.3  # 130%and
+            mention_volume = 1.3  # 130% of baseline
             
-            # translated
+            # Placeholder sentiment distribution
             sentiment_distribution = {
-                'bullish': 0.4,   # 40%translated
-                'bearish': 0.3,   # 30%translated
-                'neutral': 0.3    # 30%mid
+                'bullish': 0.4,
+                'bearish': 0.3,
+                'neutral': 0.3
             }
             
-            # translated（weight high）
-            influencer_sentiment = 0.2  # translated
+            influencer_sentiment = 0.2
             
             # trend strength
             trend_strength = abs(sentiment_distribution['bullish'] - sentiment_distribution['bearish'])
             
-            # translated
+            # Composite social score
             social_score = (
                 sentiment_distribution['bullish'] * 1 + 
                 sentiment_distribution['bearish'] * (-1) + 
                 sentiment_distribution['neutral'] * 0
             )
             
-            # weight
+            # Weight retail/social chatter and higher-signal influencer sentiment
             adjusted_score = social_score * 0.7 + influencer_sentiment * 0.3
             
             return {
@@ -7097,30 +7306,26 @@ translatedReason: {reason}
                 'trend_strength': 0.0
             }
     
-    # translated analyze_positioning_data - simplified
+    # Simplified positioning-data placeholder
     def analyze_positioning_data(self) -> Dict[str, Any]:
-        """translated"""
+        """Return a placeholder positioning-data snapshot."""
         try:
-            # translated
-            # translatedCOTtranslated
+            # Placeholder positioning proxies
             
-            # large
-            large_trader_net_long = 0.15  # 15%bullish
+            large_trader_net_long = 0.15  # 15% net long
             
-            # translated
-            retail_sentiment = -0.1  # translated
+            retail_sentiment = -0.1
             
-            # translated
-            institutional_flow = 0.05  # 5%translated
+            institutional_flow = 0.05  # 5%
             
-            # translated
+            # Largest absolute positioning signal
             positioning_extreme = max(
                 abs(large_trader_net_long),
                 abs(retail_sentiment),
                 abs(institutional_flow)
             )
             
-            # indicator（translated）
+            # Contrarian interpretation of retail sentiment
             contrarian_signal = 'bullish' if retail_sentiment < -0.15 else 'bearish' if retail_sentiment > 0.15 else 'neutral'
             
             return {
@@ -7141,26 +7346,21 @@ translatedReason: {reason}
                 'positioning_risk': 'low'
             }
     
-    # translated analyze_intermarket_sentiment - simplified
+    # Simplified intermarket sentiment placeholder
     def analyze_intermarket_sentiment(self) -> Dict[str, Any]:
-        """translated"""
+        """Return a placeholder intermarket-sentiment snapshot."""
         try:
-            # translated
-            # translated、translated、translated、translated
+            # Placeholder intermarket proxies
             
-            # translated
-            stock_bond_correlation = -0.3  # as
+            stock_bond_correlation = -0.3
             
-            # strength
-            dollar_strength = 0.02  # translated2%
+            dollar_strength = 0.02  # 2%
             
-            # translated
-            commodity_performance = -0.01  # down
+            commodity_performance = -0.01
             
-            # translated
-            safe_haven_flows = 0.5  # mid
+            safe_haven_flows = 0.5
             
-            # indicator
+            # Simple stress/risk-appetite proxies
             intermarket_stress = abs(stock_bond_correlation + 0.5) + abs(dollar_strength) * 10
             
             # risk indicator
@@ -7187,12 +7387,12 @@ translatedReason: {reason}
             }
     
     def calculate_composite_sentiment(self, components: Dict[str, Any]) -> float:
-        """calculate"""
+        """Combine enabled sentiment components into a 0-100 score."""
         try:
             sentiment_values = []
             weights = []
             
-            # translated
+            # Fear/greed component
             if 'fear_greed' in components:
                 sentiment_values.append(components['fear_greed']['index_value'])
                 weights.append(self.sentiment_indicators['fear_greed_index']['weight'])
@@ -7203,36 +7403,36 @@ translatedReason: {reason}
                 sentiment_values.append(vol_sentiment)
                 weights.append(self.sentiment_indicators['vix_equivalent']['weight'])
             
-            # new
+            # News sentiment component
             if 'news_sentiment' in components:
                 news_score = (components['news_sentiment']['sentiment_score'] + 1) * 50
                 sentiment_values.append(news_score)
                 weights.append(self.sentiment_indicators['news_sentiment']['weight'])
             
-            # translated
+            # Social sentiment component
             if 'social_sentiment' in components:
                 social_score = (components['social_sentiment']['sentiment_score'] + 1) * 50
                 sentiment_values.append(social_score)
                 weights.append(self.sentiment_indicators['social_sentiment']['weight'])
             
-            # translated
+            # Positioning sentiment component
             if 'positioning_sentiment' in components:
-                pos_score = 50  # mid value，translated
+                pos_score = 50  # neutral placeholder
                 sentiment_values.append(pos_score)
                 weights.append(self.sentiment_indicators['positioning_data']['weight'])
             
-            # translated
+            # Intermarket sentiment component
             if 'intermarket_sentiment' in components:
                 inter_score = (components['intermarket_sentiment']['risk_appetite'] + 1) * 50
                 sentiment_values.append(inter_score)
                 weights.append(self.sentiment_indicators['intermarket_sentiment']['weight'])
             
-            # translated
+            # Weighted average
             if sentiment_values and weights:
                 total_weight = sum(weights)
                 composite_sentiment = sum(s * w for s, w in zip(sentiment_values, weights)) / total_weight
             else:
-                composite_sentiment = 50  # default mid
+                composite_sentiment = 50  # neutral default
             
             return max(0, min(100, composite_sentiment))
             
@@ -7319,9 +7519,9 @@ translatedReason: {reason}
             }
     
     def detect_contrarian_opportunity(self, composite_sentiment: float) -> Dict[str, Any]:
-        """translated"""
+        """Detect simple contrarian opportunities from composite sentiment."""
         try:
-            # translated
+            # Default no-opportunity state
             contrarian_opportunity = {
                 'opportunity_detected': False,
                 'opportunity_type': None,
@@ -7329,15 +7529,15 @@ translatedReason: {reason}
                 'recommended_action': 'hold'
             }
             
-            # translated
-            if composite_sentiment <= 25:  # translated
+            # Extreme-fear and extreme-greed thresholds
+            if composite_sentiment <= 25:
                 contrarian_opportunity.update({
                     'opportunity_detected': True,
                     'opportunity_type': 'extreme_fear_buying',
                     'strength': (25 - composite_sentiment) / 25,
                     'recommended_action': 'aggressive_buy'
                 })
-            elif composite_sentiment >= 75:  # translated
+            elif composite_sentiment >= 75:
                 contrarian_opportunity.update({
                     'opportunity_detected': True,
                     'opportunity_type': 'extreme_greed_selling',
@@ -7345,7 +7545,7 @@ translatedReason: {reason}
                     'recommended_action': 'reduce_exposure'
                 })
             
-            # fast
+            # Detect fast sentiment reversals
             if len(self.sentiment_history['composite_sentiment']) >= 5:
                 recent_sentiments = self.sentiment_history['composite_sentiment'][-5:]
                 sentiment_velocity = recent_sentiments[-1] - recent_sentiments[0]
@@ -7369,15 +7569,15 @@ translatedReason: {reason}
             }
     
     def update_sentiment_history(self, sentiment_analysis: Dict[str, Any]):
-        """update record"""
+        """Update the rolling sentiment history."""
         try:
-            # update
+            # Composite sentiment history
             self.sentiment_history['composite_sentiment'].append(sentiment_analysis['composite_sentiment'])
             
-            # update
+            # Sentiment state history
             self.sentiment_history['sentiment_state'].append(sentiment_analysis['sentiment_state'])
             
-            # record value
+            # Track extreme sentiment readings
             if sentiment_analysis['composite_sentiment'] <= 25 or sentiment_analysis['composite_sentiment'] >= 75:
                 extreme_record = {
                     'timestamp': sentiment_analysis['timestamp'],
@@ -7386,7 +7586,7 @@ translatedReason: {reason}
                 }
                 self.sentiment_history['sentiment_extremes'].append(extreme_record)
             
-            # record signal
+            # Track contrarian signals
             if sentiment_analysis.get('contrarian_opportunity', {}).get('opportunity_detected'):
                 contrarian_record = {
                     'timestamp': sentiment_analysis['timestamp'],
@@ -7395,7 +7595,7 @@ translatedReason: {reason}
                 }
                 self.sentiment_history['contrarian_signals'].append(contrarian_record)
             
-            # record long
+            # Trim long histories
             for key, history in self.sentiment_history.items():
                 if len(history) > 500:
                     self.sentiment_history[key] = history[-250:]
@@ -7404,15 +7604,15 @@ translatedReason: {reason}
             pass
     
     def get_sentiment_analysis_report(self) -> Dict[str, Any]:
-        """get"""
+        """Return a compact summary of recent sentiment history."""
         try:
             if not self.sentiment_history['composite_sentiment']:
-                return {'error': 'none'}
+                return {'error': 'no sentiment history available'}
             
             recent_sentiment = self.sentiment_history['composite_sentiment'][-1]
             recent_state = self.sentiment_history['sentiment_state'][-1]
             
-            # translated
+            # Recent sentiment statistics
             sentiment_stats = {
                 'current_sentiment': recent_sentiment,
                 'current_state': recent_state,
@@ -7430,17 +7630,16 @@ translatedReason: {reason}
             }
             
         except Exception:
-            return {'error': 'none'}
+            return {'error': 'sentiment report unavailable'}
     
-    # === 🛡️ ATRtranslated ===
+    # === ATR-based stoploss helpers ===
     
     def _get_trade_entry_atr(self, trade: Trade, dataframe: DataFrame) -> float:
         """
-        getATRvalue - as calculate
-        avoid or
+        Get the ATR value near trade entry for adaptive stop calculations.
         """
         try:
-            # use time toKtranslated
+            # Align the trade open time to the prior candle boundary
             from freqtrade.misc import timeframe_to_prev_date
             
             entry_date = timeframe_to_prev_date(self.timeframe, trade.open_date_utc)
@@ -7448,38 +7647,37 @@ translatedReason: {reason}
             
             if not entry_candles.empty and 'atr_p' in entry_candles.columns:
                 entry_atr = entry_candles['atr_p'].iloc[-1]
-                # range check
+                # Sanity-check the ATR range
                 if 0.005 <= entry_atr <= 0.20:
                     return entry_atr
                     
         except Exception as e:
-            logger.warning(f"getATRtranslated: {e}")
+            logger.warning(f"Failed to get entry ATR: {e}")
             
-        # translated：use most20translatedATRmid
+        # Fallback to the recent 20-candle median ATR
         if 'atr_p' in dataframe.columns and len(dataframe) >= 20:
             return dataframe['atr_p'].tail(20).median()
         
-        # most after：value
+        # Final asset-class fallback
         if 'BTC' in trade.pair or 'ETH' in trade.pair:
-            return 0.02  # translated
+            return 0.02
         else:
-            return 0.035  # large
+            return 0.035
     
     def _calculate_atr_multiplier(self, entry_atr_p: float, current_candle: dict, enter_tag: str) -> float:
         """
-        calculateATRtranslated - translated，translated
-        signal
+        Calculate the ATR stop multiplier based on signal type and current conditions.
         """
-        # translated：translated2.5-3.5as most range
+        # Baseline ATR multiplier
         base_multiplier = 2.8
         
-        # === 1. signal ===
+        # === 1. Signal-specific adjustments ===
         signal_adjustments = {
-            'RSI_Oversold_Bounce': 2.5,    # RSIsignal，1
+            'RSI_Oversold_Bounce': 2.5,
             'RSI_Overbought_Fall': 2.5,    
-            'MACD_Bearish': 3.2,           # MACDsignal breakout，translated
+            'MACD_Bearish': 3.2,
             'MACD_Bullish': 3.2,
-            'EMA_Golden_Cross': 2.6,       # trend signal，mid
+            'EMA_Golden_Cross': 2.6,
             'EMA_Death_Cross': 2.6,
         }
         
@@ -7489,42 +7687,41 @@ translatedReason: {reason}
         current_atr_p = current_candle.get('atr_p', entry_atr_p)
         volatility_ratio = current_atr_p / entry_atr_p
         
-        if volatility_ratio > 1.5:      # before high50%
-            multiplier *= 1.2           # translated20%
-        elif volatility_ratio < 0.7:    # before low30%
-            multiplier *= 0.9           # translated10%
+        if volatility_ratio > 1.5:
+            multiplier *= 1.2
+        elif volatility_ratio < 0.7:
+            multiplier *= 0.9
         
         # === 3. trend strength ===
         adx = current_candle.get('adx', 25)
         if adx > 35:                    # strong trend
             multiplier *= 1.15          # trend
-        elif adx < 20:                  # translated
-            multiplier *= 0.85          # avoid
+        elif adx < 20:
+            multiplier *= 0.85
         
-        # translated
+        # Final bounded multiplier
         return max(1.5, min(4.0, multiplier))
     
     def _calculate_time_decay(self, hours_held: float, current_profit: float) -> float:
         """
-        time - long
-        time long，translated
+        Reduce stop distance as trades age, especially when they are not working.
         """
-        # profit，time
-        if current_profit > 0.02:       # profit2%to up
-            decay_start_hours = 72      # 3after
-        elif current_profit > -0.02:    # small loss
-            decay_start_hours = 48      # 2after  
-        else:                           # large loss
-            decay_start_hours = 24      # 1after
+        # More profitable trades get longer before time decay tightens stops
+        if current_profit > 0.02:
+            decay_start_hours = 72
+        elif current_profit > -0.02:
+            decay_start_hours = 48
+        else:
+            decay_start_hours = 24
         
         if hours_held <= decay_start_hours:
-            return 1.0                  # none
+            return 1.0
             
-        # translated：translated24hours10%
+        # Reduce by 10% for every extra 24 hours
         excess_hours = hours_held - decay_start_hours
         decay_periods = excess_hours / 24
         
-        # most to original50%
+        # Do not reduce below 50% of the original distance
         min_factor = 0.5
         decay_factor = max(min_factor, 1.0 - (decay_periods * 0.1))
         
@@ -7532,76 +7729,76 @@ translatedReason: {reason}
     
     def _calculate_profit_protection(self, current_profit: float) -> Optional[float]:
         """
-        profit - translated，profit
+        Tighten stoploss once a trade reaches meaningful profit.
         """
-        if current_profit > 0.15:      # profit15%+，translated75%translated
-            return -0.0375              # allow3.75%drawdown
-        elif current_profit > 0.10:    # profit10%+，translated60%translated  
-            return -0.04                # allow4%drawdown
-        elif current_profit > 0.08:    # profit8%+，translated50%translated
-            return -0.04                # allow4%drawdown
-        elif current_profit > 0.05:    # profit5%+，translated+
-            return -0.01                # allow1%drawdown
-        elif current_profit > 0.03:    # profit3%+，translated
-            return 0.001                # translated+translated
+        if current_profit > 0.15:
+            return -0.0375
+        elif current_profit > 0.10:
+            return -0.04
+        elif current_profit > 0.08:
+            return -0.04
+        elif current_profit > 0.05:
+            return -0.01
+        elif current_profit > 0.03:
+            return 0.001
         
-        return None                     # none profit，useATRtranslated
+        return None
     
     def _calculate_trend_adjustment(self, current_candle: dict, is_short: bool, entry_atr_p: float) -> float:
         """
-        trend strength - translated，translated
+        Adjust stop distance based on trend alignment.
         """
-        # get trend indicator
+        # Trend indicators
         ema_8 = current_candle.get('ema_8', 0)
         ema_21 = current_candle.get('ema_21', 0)
         adx = current_candle.get('adx', 25)
         current_price = current_candle.get('close', 0)
         
-        # trend
+        # Basic trend state
         is_uptrend = ema_8 > ema_21 and adx > 25
         is_downtrend = ema_8 < ema_21 and adx > 25
         
-        # trend 1 check
-        if is_short and is_downtrend:      # short+down trend，translated
-            return 1.2                     # translated20%
-        elif not is_short and is_uptrend:  # long+up trend，translated
-            return 1.2                     # translated20%
-        elif is_short and is_uptrend:      # short+up trend，translated
-            return 0.8                     # translated20%
-        elif not is_short and is_downtrend: # long+down trend，translated  
-            return 0.8                     # translated20%
-        else:                              # or not
-            return 1.0                     # none
+        # Favor looser stops when the trade aligns with the trend
+        if is_short and is_downtrend:
+            return 1.2
+        elif not is_short and is_uptrend:
+            return 1.2
+        elif is_short and is_uptrend:
+            return 0.8
+        elif not is_short and is_downtrend:
+            return 0.8
+        else:
+            return 1.0
     
     def _log_stoploss_calculation(self, pair: str, trade: Trade, current_profit: float,
                                  entry_atr_p: float, base_atr_multiplier: float,
                                  time_decay_factor: float, trend_adjustment: float,
                                  final_stoploss: float):
         """
-        record calculate - optimize
+        Log the components of the ATR-based stoploss calculation.
         """
         hours_held = (datetime.now(timezone.utc) - trade.open_date_utc).total_seconds() / 3600
         
         logger.info(
-            f"🛡️ ATRtranslated {pair} [{trade.enter_tag}]: "
-            f"profit{current_profit:.1%} | "
-            f"translated{hours_held:.1f}h | "
-            f"translatedATR{entry_atr_p:.3f} | "
-            f"ATRtranslated{base_atr_multiplier:.1f} | "
-            f"time{time_decay_factor:.2f} | " 
-            f"trend{trend_adjustment:.2f} | "
-            f"most{final_stoploss:.3f}"
+            f"🛡️ ATR stoploss {pair} [{trade.enter_tag}]: "
+            f"profit={current_profit:.1%} | "
+            f"held={hours_held:.1f}h | "
+            f"entry_atr={entry_atr_p:.3f} | "
+            f"atr_multiplier={base_atr_multiplier:.1f} | "
+            f"time_decay={time_decay_factor:.2f} | "
+            f"trend_adj={trend_adjustment:.2f} | "
+            f"stop={final_stoploss:.3f}"
         )
     
     def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
                        current_rate: float, current_profit: float, 
                        after_fill: bool = False, **kwargs) -> Optional[float]:
         """
-        🚀 translatedATRtranslated
-        - translatedATRtranslated
-        - time long
-        - profit
-        - trend strength
+        ATR-based adaptive stoploss:
+        - entry ATR baseline
+        - time decay
+        - profit protection
+        - trend alignment
         """
         try:
             # get most new
@@ -7611,42 +7808,40 @@ translatedReason: {reason}
                 
             current_candle = dataframe.iloc[-1]
             
-            # === 1. getATR (translated) ===
+            # === 1. Entry ATR baseline ===
             entry_atr_p = self._get_trade_entry_atr(trade, dataframe)
             current_atr_p = current_candle.get('atr_p', 0.02)
             
-            # === 2. calculateATRtranslated ===
-            # translated2.5-3translatedATRas most，translated
+            # === 2. ATR-based stop distance ===
             base_atr_multiplier = self._calculate_atr_multiplier(
                 entry_atr_p, current_candle, trade.enter_tag
             )
             base_stop_distance = entry_atr_p * base_atr_multiplier
             
-            # === 3. time ===
-            # translated，translated，long
+            # === 3. Time decay ===
             hours_held = (current_time - trade.open_date_utc).total_seconds() / 3600
             time_decay_factor = self._calculate_time_decay(hours_held, current_profit)
             
-            # === 4. profit ===
+            # === 4. Profit protection ===
             profit_protection = self._calculate_profit_protection(current_profit)
             if profit_protection is not None:
                 return profit_protection
                 
-            # === 5. trend strength ===
+            # === 5. Trend adjustment ===
             trend_adjustment = self._calculate_trend_adjustment(
                 current_candle, trade.is_short, entry_atr_p
             )
             
-            # === 6. most calculate ===
+            # === 6. Final stop distance ===
             final_stop_distance = (base_stop_distance * time_decay_factor * trend_adjustment)
             
-            # translated：most small1%，most large8%
+            # Keep stop distance within 1% to 8%
             final_stop_distance = max(0.01, min(0.08, final_stop_distance))
             
             # short
             final_stoploss = -final_stop_distance if not trade.is_short else final_stop_distance
             
-            # === 7. day record ===
+            # === 7. Optional verbose logging ===
             if self.config.get('verbosity', 0) > 1:
                 self._log_stoploss_calculation(
                     pair, trade, current_profit, entry_atr_p, base_atr_multiplier,
@@ -7656,14 +7851,13 @@ translatedReason: {reason}
             return final_stoploss
             
         except Exception as e:
-            logger.error(f"ATRcalculate {pair}: {e}")
-            # use
+            logger.error(f"ATR stoploss calculation failed for {pair}: {e}")
+            # Fallback fixed stop
             return -0.03 if not trade.is_short else 0.03
     
     def _calculate_signal_quality_score(self, dataframe: DataFrame, signal_mask: pd.Series, signal_type: str) -> pd.Series:
         """
-        🎯 signal score (1-10translated)
-        signal，as risk
+        Score signal quality on a 1-10 scale for sizing and leverage decisions.
         """
         # initialize score
         scores = pd.Series(0.0, index=dataframe.index)
@@ -7673,10 +7867,10 @@ translatedReason: {reason}
         
         for idx in signal_indices:
             try:
-                score = 3.0  # translated
+                score = 3.0  # baseline score
                 current_data = dataframe.loc[idx]
                 
-                # === 1. indicator 1 (0-2translated) ===
+                # === 1. Indicator quality (0-2) ===
                 rsi = current_data.get('rsi_14', 50)
                 if signal_type in ['RSI_Oversold_Bounce']:
                     if rsi < 25:
@@ -7689,7 +7883,7 @@ translatedReason: {reason}
                     elif rsi > 70:
                         score += 1.5  # overbought
                 
-                # === 2. trend strength and (0-2translated) ===
+                # === 2. Trend alignment and strength (0-2) ===
                 adx = current_data.get('adx', 25)
                 ema_8 = current_data.get('ema_8', 0)
                 ema_21 = current_data.get('ema_21', 0)
@@ -7704,7 +7898,7 @@ translatedReason: {reason}
                 elif 20 < adx <= 30:  # medium trend
                     score += 1
                 
-                # === 3. volume confirmation (0-1.5translated) ===
+                # === 3. Volume confirmation (0-1.5) ===
                 volume_ratio = current_data.get('volume_ratio', 1.0)
                 if volume_ratio > 1.5:
                     score += 1.5  # volume
@@ -7713,14 +7907,14 @@ translatedReason: {reason}
                 elif volume_ratio > 1.0:
                     score += 0.5  # volume
                 
-                # === 4. volatility (0-1translated) ===
+                # === 4. Volatility regime (0-1) ===
                 atr_percentile = dataframe['atr_p'].rolling(50).rank(pct=True).loc[idx]
-                if 0.2 <= atr_percentile <= 0.8:  # translated
+                if 0.2 <= atr_percentile <= 0.8:
                     score += 1
                 elif atr_percentile > 0.9:  # high volatility，risk large
                     score -= 0.5
                 
-                # === 5. divergence signal (0-1translated) ===
+                # === 5. Divergence filter (0-1) ===
                 no_bearish_div = not current_data.get('bearish_divergence', False)
                 no_bullish_div = not current_data.get('bullish_divergence', False)
                 
@@ -7729,7 +7923,7 @@ translatedReason: {reason}
                 elif signal_type in ['RSI_Overbought_Fall'] and no_bullish_div:
                     score += 1
                 
-                # === 6. translated (0-0.5translated) ===
+                # === 6. Price-position quality (0-0.5) ===
                 price_position = current_data.get('price_position', 0.5)
                 if signal_type in ['RSI_Oversold_Bounce'] and 0.2 < price_position < 0.7:
                     score += 0.5  # not at long
@@ -7747,8 +7941,7 @@ translatedReason: {reason}
     
     def _calculate_macd_signal_quality(self, dataframe: DataFrame, signal_mask: pd.Series, signal_type: str) -> pd.Series:
         """
-        🎯 MACDsignal score (1-10translated)
-        translatedMACDsignal，score
+        Score MACD-based signals on a 1-10 scale.
         """
         # initialize score
         scores = pd.Series(0.0, index=dataframe.index)
@@ -7758,21 +7951,21 @@ translatedReason: {reason}
         
         for idx in signal_indices:
             try:
-                score = 2.0  # MACDsignal low，confirm
+                score = 2.0  # baseline MACD score
                 current_data = dataframe.loc[idx]
                 
-                # === 1. MACDsignal strength (0-2.5translated) ===
+                # === 1. MACD cross strength (0-2.5) ===
                 macd = current_data.get('macd', 0)
                 macd_signal = current_data.get('macd_signal', 0)
                 macd_hist = current_data.get('macd_hist', 0)
                 
-                # MACDlarge，signal
+                # Magnitude of the MACD separation
                 cross_magnitude = abs(macd - macd_signal)
-                if cross_magnitude > 0.002:  # translated
+                if cross_magnitude > 0.002:
                     score += 2.5
-                elif cross_magnitude > 0.001:  # translated
+                elif cross_magnitude > 0.001:
                     score += 1.5
-                elif cross_magnitude > 0.0005:  # translated
+                elif cross_magnitude > 0.0005:
                     score += 1.0
                 
                 # === 2. trend 1 (0-2translated) ===
@@ -8301,14 +8494,14 @@ translatedReason: {reason}
             (
                 strong_reversal_short_exit |  # reversal
                 trend_exhaustion_short |       # trend
-                technical_exit_short |         # translated
-                microstructure_exit_short |    # translated
+                technical_exit_short |         # technical exit signal
+                microstructure_exit_short |    # orderbook/microstructure exit signal
                 (volatility_protection & is_bull_market)  # mid
             ),
             'exit_short'
         ] = 1
 
-        # to
+        # Assign exit tags
         dataframe.loc[strong_reversal_long_exit, 'exit_tag'] = 'strong_reversal'
         dataframe.loc[trend_exhaustion_long, 'exit_tag'] = 'trend_exhaustion'
         dataframe.loc[technical_exit_long, 'exit_tag'] = 'technical_exit'
@@ -8316,23 +8509,23 @@ translatedReason: {reason}
         dataframe.loc[volatility_protection, 'exit_tag'] = 'volatility_protection'
 
         # ==============================
-        # 🚨 fix：translated - avoidKsignal
+        # Resolve conflicting long/short entry signals
         # ==============================
         
-        # 1Ksignal
+        # Detect bars where both long and short entries were set
         signal_conflict = (dataframe['enter_long'] == 1) & (dataframe['enter_short'] == 1)
         
-        # translated：signal strength or trend
+        # Favor long when trend/momentum conditions lean bullish
         conflict_resolution_favor_long = (
             signal_conflict &
             (
-                (dataframe['trend_strength'] > 0) |  # trend long
-                (dataframe['rsi_14'] < 50) |         # RSIlow long
-                (dataframe['macd_hist'] > dataframe['macd_hist'].shift(1))  # MACDlong
+                (dataframe['trend_strength'] > 0) |
+                (dataframe['rsi_14'] < 50) |
+                (dataframe['macd_hist'] > dataframe['macd_hist'].shift(1))
             )
         )
         
-        # translated：high signal，low signal
+        # Clear the weaker side of the conflict
         dataframe.loc[conflict_resolution_favor_long, 'enter_short'] = 0
         dataframe.loc[signal_conflict & ~conflict_resolution_favor_long, 'enter_long'] = 0
         
@@ -8340,8 +8533,7 @@ translatedReason: {reason}
         clean_enter_long = dataframe['enter_long'] == 1
         clean_enter_short = dataframe['enter_short'] == 1
         
-        # translated：at
-        # original：translated，translated
+        # Cross-close opposing positions only when the new signal is reasonably strong
         strong_bullish_signal = (
             clean_enter_long &
             (dataframe['rsi_14'] > 30) &  # avoid at oversold
@@ -8354,11 +8546,11 @@ translatedReason: {reason}
             (dataframe['volume_ratio'] > 1.1)  # volume support
         )
         
-        # translated（avoid）
+        # Use strong entry signals to close the opposite side
         dataframe.loc[strong_bullish_signal, 'exit_short'] = 1
         dataframe.loc[strong_bearish_signal, 'exit_long'] = 1
         
-        # updateexit_tagto（translated）
+        # Update exit tags for these smart cross exits
         dataframe.loc[
             strong_bullish_signal & (dataframe['exit_short'] == 1),
             'exit_tag'
@@ -8369,16 +8561,16 @@ translatedReason: {reason}
             'exit_tag' 
         ] = 'smart_cross_exit_bearish'
 
-        # record signal
+        # Exit-signal summary
         exit_long_count = dataframe['exit_long'].sum()
         exit_short_count = dataframe['exit_short'].sum()
 
         if exit_long_count > 0 or exit_short_count > 0:
             logger.info(f"""
-📤 signal - {metadata['pair']}:
-├─ long signal: {exit_long_count}count
-├─ short signal: {exit_short_count}count
-└─ time range: {dataframe.index[0]} - {dataframe.index[-1]}
+📤 Exit signal summary - {metadata['pair']}:
+├─ Long exits: {exit_long_count}
+├─ Short exits: {exit_short_count}
+└─ Time range: {dataframe.index[0]} - {dataframe.index[-1]}
 """)
 
         return dataframe
@@ -8387,7 +8579,7 @@ translatedReason: {reason}
                           proposed_stake: float, min_stake: Optional[float], max_stake: float,
                           leverage: float, entry_tag: Optional[str], side: str,
                           **kwargs) -> float:
-        """position size large small"""
+        """Return a dynamic stake amount for the proposed entry."""
         
         try:
             # get most new
@@ -8395,51 +8587,67 @@ translatedReason: {reason}
             if dataframe.empty:
                 return proposed_stake
             
-            # get market state
+            # Current market regime inputs
             market_state = dataframe['market_state'].iloc[-1] if 'market_state' in dataframe.columns else 'sideways'
             volatility = dataframe['atr_p'].iloc[-1] if 'atr_p' in dataframe.columns else 0.02
             
-            # === 🎯 risk ===
+            # === Coin risk tier ===
             coin_risk_tier = self.identify_coin_risk_tier(pair, dataframe)
             
-            # risk（small position size to small large）
+            # Risk-tier stake multipliers
             coin_risk_multipliers = {
-                'low_risk': 1.0,        # low risk：position size
-                'medium_risk': 0.7,     # medium risk：70%position size
-                'high_risk': 0.25       # high risk（translated）：25%position size，to small large
+                'low_risk': 1.0,
+                'medium_risk': 0.7,
+                'high_risk': 0.25
             }
             
-            # get risk
+            # Selected risk-tier multiplier
             coin_risk_multiplier = coin_risk_multipliers.get(coin_risk_tier, 0.7)
             
-            # calculate position size large small
+            # Base portfolio position-size ratio
             position_size_ratio = self.calculate_position_size(current_rate, market_state, pair)
             
-            # get
+            # Available balance
             available_balance = self.wallets.get_free(self.config['stake_currency'])
             
-            # === risk to position size calculate ===
-            # position size calculate
+            # === Raw stake calculation ===
             base_calculated_stake = available_balance * position_size_ratio
             
-            # risk（small position size）
+            # Apply risk-tier reduction
             calculated_stake = base_calculated_stake * coin_risk_multiplier
             
-            # calculate leverage
+            # Dynamic leverage for this setup
             dynamic_leverage = self.calculate_leverage(market_state, volatility, pair, current_time)
             
-            # translated：atFreqtrademid，leverageleverage()translated，calculate position size
-            # leverage，not to leverage
-            # leveraged_stake = calculated_stake * dynamic_leverage  # translated
+            # Freqtrade applies leverage separately, so keep stake in stake-currency terms
             leveraged_stake = calculated_stake  # position size
             
-            # record leverage
+            # Preserve the unadjusted position value for logging
             base_position_value = calculated_stake
             
-            # at range
+            # Clamp to configured min/max stake bounds
             final_stake = max(min_stake or 0, min(leveraged_stake, max_stake))
+
+            news_signal = self._get_news_signal(pair, current_time)
+            if news_signal and news_signal.backend_available:
+                news_multiplier = float(news_signal.recommended_stake_multiplier)
+                if news_multiplier < 1.0 or (
+                    news_multiplier > 1.0 and news_signal.confidence >= 0.50
+                ):
+                    final_stake = max(
+                        min_stake or 0,
+                        min(final_stake * news_multiplier, max_stake),
+                    )
+                    logger.info(
+                        "News sentiment adjusted stake for %s: multiplier=%.2f confidence=%.2f fallback=%s reasons=%s",
+                        pair,
+                        news_multiplier,
+                        news_signal.confidence,
+                        news_signal.fallback_used,
+                        "; ".join(news_signal.reasons),
+                    )
             
-            # leverage day
+            # Human-readable risk tier names
             risk_tier_names = {
                 'low_risk': '✅ low risk',
                 'medium_risk': '⚡ medium risk', 
@@ -8447,19 +8655,19 @@ translatedReason: {reason}
             }
             
             logger.info(f"""
-🎯 position size calculate - {pair}:
-├─ market state: {market_state}
-├─ 🔍 risk level: {risk_tier_names.get(coin_risk_tier, coin_risk_tier)}
-├─ 📊 position size: ${base_calculated_stake:.2f} ({position_size_ratio:.2%})
-├─ 🎯 risk adjustment: {coin_risk_multiplier:.2f}x ({coin_risk_tier})
-├─ 💰 after position size: ${calculated_stake:.2f}
-├─ ⚡ calculate leverage: {dynamic_leverage}x (translatedleverage()translated)
-├─ 🎉 most: ${final_stake:.2f}
-├─ 📈 translated: {final_stake / current_rate:.6f}
-└─ ⏰ time: {current_time}
+🎯 Stake sizing - {pair}:
+├─ Market state: {market_state}
+├─ Risk tier: {risk_tier_names.get(coin_risk_tier, coin_risk_tier)}
+├─ Base stake: ${base_calculated_stake:.2f} ({position_size_ratio:.2%} of free balance)
+├─ Risk adjustment: {coin_risk_multiplier:.2f}x ({coin_risk_tier})
+├─ Risk-adjusted stake: ${calculated_stake:.2f}
+├─ Dynamic leverage: {dynamic_leverage}x
+├─ Final stake: ${final_stake:.2f}
+├─ Estimated base-asset size: {final_stake / current_rate:.6f}
+└─ Timestamp: {current_time}
 """)
             
-            # translated：before leverage（translatedFreqtradeuse）
+            # Persist the chosen leverage for downstream logging/risk logic
             if hasattr(self, '_current_leverage'):
                 self._current_leverage[pair] = dynamic_leverage
             else:
@@ -8480,7 +8688,7 @@ translatedReason: {reason}
                 'adjusted_position': position_size_ratio,
                 'suggested_leverage': dynamic_leverage,
                 'risk_rating': self._calculate_risk_rating(final_stake * abs(self.stoploss) / available_balance),
-                'rating_reason': f'translated{market_state}market state{volatility*100:.1f}%volatility'
+                'rating_reason': f'{market_state} market with {volatility*100:.1f}% volatility'
             })
             
             return final_stake
@@ -8495,28 +8703,28 @@ translatedReason: {reason}
                             current_entry_rate: float, current_exit_rate: float,
                             current_entry_profit: float, current_exit_profit: float,
                             **kwargs) -> Optional[float]:
-        """translatedDCAtranslated - confirm and risk"""
+        """Evaluate DCA opportunities with confirmation and risk controls."""
         
-        # check allowDCA
+        # Respect the configured DCA limit
         if trade.nr_of_successful_entries >= self.max_dca_orders:
-            logger.info(f"DCAtranslated {trade.pair}: most large times {self.max_dca_orders}")
+            logger.info(f"DCA skipped for {trade.pair}: reached max entries ({self.max_dca_orders})")
             return None
             
-        # get indicator
+        # Load the latest indicators
         dataframe = self.get_dataframe_with_indicators(trade.pair, self.timeframe)
         if dataframe.empty:
-            logger.warning(f"DCAcheck {trade.pair}: none")
+            logger.warning(f"DCA check skipped for {trade.pair}: no dataframe available")
             return None
             
-        # most check indicator at
+        # Ensure the required indicators are present
         required_indicators = ['rsi_14', 'adx', 'atr_p', 'macd', 'macd_signal', 'volume_ratio', 'trend_strength', 'momentum_score']
         missing_indicators = [indicator for indicator in required_indicators if indicator not in dataframe.columns]
         
         if missing_indicators:
-            logger.warning(f"DCAcheck {trade.pair}: indicator still {missing_indicators}，translatedDCA")
+            logger.warning(f"DCA check skipped for {trade.pair}: missing indicators {missing_indicators}")
             return None
             
-        # get indicator
+        # Current and previous indicator snapshots
         current_data = dataframe.iloc[-1]
         prev_data = dataframe.iloc[-2] if len(dataframe) > 1 else current_data
         
@@ -8530,13 +8738,13 @@ translatedReason: {reason}
         bb_position = current_data.get('bb_position', 0.5)
         market_state = current_data.get('market_state', 'sideways')
         
-        # calculate
+        # Trade state metrics
         entry_price = trade.open_rate
         price_deviation = abs(current_rate - entry_price) / entry_price
         hold_time = current_time - trade.open_date_utc
         hold_hours = hold_time.total_seconds() / 3600
         
-        # === translatedDCAtranslated ===
+        # === DCA opportunity analysis ===
         
         dca_decision = self._analyze_dca_opportunity(
             trade, current_rate, current_profit, price_deviation,
@@ -8544,39 +8752,39 @@ translatedReason: {reason}
         )
         
         if dca_decision['should_dca']:
-            # calculateDCAtranslated
+            # Calculate the proposed DCA amount
             dca_amount = self._calculate_smart_dca_amount(
                 trade, dca_decision, current_data, market_state
             )
             
-            # most risk check
+            # Final risk validation
             risk_check = self._dca_risk_validation(trade, dca_amount, current_data)
             
             if risk_check['approved']:
                 final_dca_amount = risk_check['adjusted_amount']
                 
-                # recordDCAday
+                # Log the DCA decision
                 self._log_dca_decision(
                     trade, current_rate, current_profit, price_deviation,
                     dca_decision, final_dca_amount, current_data
                 )
                 
-                # translatedDCAtranslated
+                # Track DCA performance for later evaluation
                 self.track_dca_performance(trade, dca_decision['dca_type'], final_dca_amount)
                 
                 return final_dca_amount
             else:
-                logger.warning(f"DCArisk check {trade.pair}: {risk_check['reason']}")
+                logger.warning(f"DCA risk validation rejected {trade.pair}: {risk_check['reason']}")
                 return None
         
         return None
     
-    # translated _analyze_dca_opportunity - simplified
+    # Simplified DCA opportunity analysis
     def _analyze_dca_opportunity(self, trade: Trade, current_rate: float, 
                                current_profit: float, price_deviation: float,
                                current_data: dict, prev_data: dict, 
                                hold_hours: float, market_state: str) -> dict:
-        """translatedDCAtranslated - translated"""
+        """Analyze whether the current trade qualifies for a DCA add."""
         
         decision = {
             'should_dca': False,
@@ -8588,27 +8796,27 @@ translatedReason: {reason}
         }
         
         try:
-            # === translatedDCAtranslated ===
+            # === Basic DCA trigger ===
             basic_trigger_met = (
-                price_deviation > self.dca_price_deviation and  # price
-                current_profit < -0.03 and  # translated3%to up（low）
-                hold_hours > 0.5  # translated30minutes
+                price_deviation > self.dca_price_deviation and
+                current_profit < -0.03 and
+                hold_hours > 0.5
             )
             
             if not basic_trigger_met:
                 return decision
             
-            # === translatedDCAtranslated ===
+            # === Direction-specific DCA setups ===
             
             if not trade.is_short:
-                # === longDCAtranslated ===
+                # === Long-side DCA setups ===
                 
-                # 1. oversoldDCA - mostDCAtranslated
+                # 1. Oversold reversal DCA
                 oversold_dca = (
-                    current_rate < trade.open_rate and  # price down
-                    current_data.get('rsi_14', 50) < 35 and  # RSIoversold
-                    current_data.get('bb_position', 0.5) < 0.2 and  # Bollinger Bands down
-                    current_data.get('momentum_score', 0) > prev_data.get('momentum_score', 0)  # momentum
+                    current_rate < trade.open_rate and
+                    current_data.get('rsi_14', 50) < 35 and
+                    current_data.get('bb_position', 0.5) < 0.2 and
+                    current_data.get('momentum_score', 0) > prev_data.get('momentum_score', 0)
                 )
                 
                 if oversold_dca:
@@ -8618,12 +8826,12 @@ translatedReason: {reason}
                         'confidence': 0.8,
                         'risk_level': 'low'
                     })
-                    decision['technical_reasons'].append(f"RSI{current_data.get('rsi_14', 50):.1f}oversold")
+                    decision['technical_reasons'].append(f"RSI oversold ({current_data.get('rsi_14', 50):.1f})")
                 
-                # 2. supportDCA - at support
-                elif (current_data.get('close', 0) > current_data.get('ema_50', 0) and  # still at long-term trend up
-                      abs(current_rate - current_data.get('ema_21', 0)) / current_rate < 0.02 and  # translatedEMA21support
-                      current_data.get('adx', 25) > 20):  # trend still has
+                # 2. Support-level DCA
+                elif (current_data.get('close', 0) > current_data.get('ema_50', 0) and
+                      abs(current_rate - current_data.get('ema_21', 0)) / current_rate < 0.02 and
+                      current_data.get('adx', 25) > 20):
                     
                     decision.update({
                         'should_dca': True,
@@ -8631,12 +8839,12 @@ translatedReason: {reason}
                         'confidence': 0.7,
                         'risk_level': 'medium'
                     })
-                    decision['technical_reasons'].append("EMA21support")
+                    decision['technical_reasons'].append("EMA21 acting as support")
                 
-                # 3. trendDCA - trend
-                elif (current_data.get('trend_strength', 50) > 30 and  # trend still up
-                      current_data.get('adx', 25) > 25 and  # ADXconfirm trend
-                      current_data.get('signal_strength', 0) > 0):  # signal still
+                # 3. Trend-continuation DCA
+                elif (current_data.get('trend_strength', 50) > 30 and
+                      current_data.get('adx', 25) > 25 and
+                      current_data.get('signal_strength', 0) > 0):
                     
                     decision.update({
                         'should_dca': True,
@@ -8644,11 +8852,11 @@ translatedReason: {reason}
                         'confidence': 0.6,
                         'risk_level': 'medium'
                     })
-                    decision['technical_reasons'].append(f"trend，trend strength{current_data.get('trend_strength', 50):.0f}")
+                    decision['technical_reasons'].append(f"trend continuation (strength {current_data.get('trend_strength', 50):.0f})")
                 
-                # 4. volume confirmationDCA - has volume support
-                elif (current_data.get('volume_ratio', 1) > 1.2 and  # volume large
-                      current_data.get('ob_depth_imbalance', 0) > 0.1):  # translated
+                # 4. Volume-confirmed DCA
+                elif (current_data.get('volume_ratio', 1) > 1.2 and
+                      current_data.get('ob_depth_imbalance', 0) > 0.1):
                     
                     decision.update({
                         'should_dca': True,
@@ -8656,17 +8864,17 @@ translatedReason: {reason}
                         'confidence': 0.5,
                         'risk_level': 'medium'
                     })
-                    decision['technical_reasons'].append(f"volume{current_data.get('volume_ratio', 1):.1f}confirm")
+                    decision['technical_reasons'].append(f"volume confirmation ({current_data.get('volume_ratio', 1):.1f}x)")
                 
             else:
-                # === shortDCAtranslated ===
+                # === Short-side DCA setups ===
                 
-                # 1. overboughtDCA - most bearishDCAtranslated
+                # 1. Overbought rejection DCA
                 overbought_dca = (
-                    current_rate > trade.open_rate and  # price up
-                    current_data.get('rsi_14', 50) > 65 and  # RSIoverbought
-                    current_data.get('bb_position', 0.5) > 0.8 and  # Bollinger Bands up
-                    current_data.get('momentum_score', 0) < prev_data.get('momentum_score', 0)  # momentum
+                    current_rate > trade.open_rate and
+                    current_data.get('rsi_14', 50) > 65 and
+                    current_data.get('bb_position', 0.5) > 0.8 and
+                    current_data.get('momentum_score', 0) < prev_data.get('momentum_score', 0)
                 )
                 
                 if overbought_dca:
@@ -8676,12 +8884,12 @@ translatedReason: {reason}
                         'confidence': 0.8,
                         'risk_level': 'low'
                     })
-                    decision['technical_reasons'].append(f"RSI{current_data.get('rsi_14', 50):.1f}overbought")
+                    decision['technical_reasons'].append(f"RSI overbought ({current_data.get('rsi_14', 50):.1f})")
                 
-                # 2. resistanceDCA - at resistance
-                elif (current_data.get('close', 0) < current_data.get('ema_50', 0) and  # still at long-term trend down
-                      abs(current_rate - current_data.get('ema_21', 0)) / current_rate < 0.02 and  # translatedEMA21resistance
-                      current_data.get('adx', 25) > 20):  # trend still has
+                # 2. Resistance-level DCA
+                elif (current_data.get('close', 0) < current_data.get('ema_50', 0) and
+                      abs(current_rate - current_data.get('ema_21', 0)) / current_rate < 0.02 and
+                      current_data.get('adx', 25) > 20):
                     
                     decision.update({
                         'should_dca': True,
@@ -8689,12 +8897,12 @@ translatedReason: {reason}
                         'confidence': 0.7,
                         'risk_level': 'medium'
                     })
-                    decision['technical_reasons'].append("EMA21resistance")
+                    decision['technical_reasons'].append("EMA21 acting as resistance")
                 
-                # 3. trendDCA - trend down
-                elif (current_data.get('trend_strength', 50) < -30 and  # trend still down
-                      current_data.get('adx', 25) > 25 and  # ADXconfirm trend
-                      current_data.get('signal_strength', 0) < 0):  # signal still
+                # 3. Trend-continuation DCA
+                elif (current_data.get('trend_strength', 50) < -30 and
+                      current_data.get('adx', 25) > 25 and
+                      current_data.get('signal_strength', 0) < 0):
                     
                     decision.update({
                         'should_dca': True,
@@ -8702,18 +8910,18 @@ translatedReason: {reason}
                         'confidence': 0.6,
                         'risk_level': 'medium'
                     })
-                    decision['technical_reasons'].append(f"down trend，trend strength{current_data.get('trend_strength', 50):.0f}")
+                    decision['technical_reasons'].append(f"downtrend continuation (strength {current_data.get('trend_strength', 50):.0f})")
             
-            # === translated ===
+            # Market conditions used to veto or discount DCA
             decision['market_conditions'] = {
                 'market_state': market_state,
-                'volatility_acceptable': current_data.get('atr_p', 0.02) < 0.06,  # volatility not high
-                'liquidity_sufficient': current_data.get('ob_market_quality', 0.5) > 0.3,  # translated
-                'spread_reasonable': current_data.get('ob_spread_pct', 0.1) < 0.4,  # translated
-                'trend_not_reversing': abs(current_data.get('trend_strength', 50)) > 20  # trend reversal
+                'volatility_acceptable': current_data.get('atr_p', 0.02) < 0.06,
+                'liquidity_sufficient': current_data.get('ob_market_quality', 0.5) > 0.3,
+                'spread_reasonable': current_data.get('ob_spread_pct', 0.1) < 0.4,
+                'trend_not_reversing': abs(current_data.get('trend_strength', 50)) > 20
             }
             
-            # not low orDCA
+            # Reject or downgrade DCA when multiple market conditions are unfavorable
             unfavorable_conditions = sum([
                 not decision['market_conditions']['volatility_acceptable'],
                 not decision['market_conditions']['liquidity_sufficient'], 
@@ -8725,70 +8933,69 @@ translatedReason: {reason}
                 decision['should_dca'] = False
                 decision['risk_level'] = 'too_high'
             elif unfavorable_conditions == 1:
-                decision['confidence'] *= 0.7  # low
+                decision['confidence'] *= 0.7
                 decision['risk_level'] = 'high'
                 
         except Exception as e:
-            logger.error(f"DCAtranslated {trade.pair}: {e}")
+            logger.error(f"DCA analysis failed for {trade.pair}: {e}")
             decision['should_dca'] = False
             
         return decision
     
     def _calculate_smart_dca_amount(self, trade: Trade, dca_decision: dict, 
                                   current_data: dict, market_state: str) -> float:
-        """calculateDCAtranslated - risk"""
+        """Calculate a risk-aware DCA amount."""
         
         try:
-            # translatedDCAtranslated
+            # Base DCA sizing inputs
             base_amount = trade.stake_amount
             entry_count = trade.nr_of_successful_entries + 1
             
-            # === translatedDCAtranslated ===
+            # DCA type multipliers
             dca_type_multipliers = {
-                'OVERSOLD_REVERSAL_DCA': 1.5,  # oversold，translated
-                'OVERBOUGHT_REJECTION_DCA': 1.5,  # overbought，translated
-                'SUPPORT_LEVEL_DCA': 1.3,  # support，mid
-                'RESISTANCE_LEVEL_DCA': 1.3,  # resistance，mid
-                'TREND_CONTINUATION_DCA': 1.2,  # trend，translated
+                'OVERSOLD_REVERSAL_DCA': 1.5,
+                'OVERBOUGHT_REJECTION_DCA': 1.5,
+                'SUPPORT_LEVEL_DCA': 1.3,
+                'RESISTANCE_LEVEL_DCA': 1.3,
+                'TREND_CONTINUATION_DCA': 1.2,
                 'TREND_CONTINUATION_DCA_SHORT': 1.2,  # bearish trend
-                'VOLUME_CONFIRMED_DCA': 1.1  # volume confirmation，translated
+                'VOLUME_CONFIRMED_DCA': 1.1
             }
             
             type_multiplier = dca_type_multipliers.get(dca_decision['dca_type'], 1.0)
             
-            # === translated ===
-            confidence_multiplier = 0.5 + (dca_decision['confidence'] * 0.8)  # 0.5-1.3translated
+            # Confidence multiplier
+            confidence_multiplier = 0.5 + (dca_decision['confidence'] * 0.8)  # 0.5-1.3 range
             
-            # === market state ===
+            # Market-state multiplier
             market_multipliers = {
-                'strong_uptrend': 1.4,  # strong trend midDCAtranslated
+                'strong_uptrend': 1.4,
                 'strong_downtrend': 1.4,
                 'mild_uptrend': 1.2,
                 'mild_downtrend': 1.2,
                 'sideways': 1.0,
-                'volatile': 0.7,  # translatedDCA
+                'volatile': 0.7,
                 'consolidation': 1.1
             }
             market_multiplier = market_multipliers.get(market_state, 1.0)
             
-            # === times ===
-            # after
+            # Reduce size on later DCA entries
             entry_decay = max(0.6, 1.0 - (entry_count - 1) * 0.15)
             
-            # === calculateDCAtranslated ===
+            # Final raw DCA amount
             total_multiplier = (type_multiplier * confidence_multiplier * 
                               market_multiplier * entry_decay)
             
             calculated_dca = base_amount * total_multiplier
             
-            # === translated ===
+            # Available balance constraint
             available_balance = self.wallets.get_free(self.config['stake_currency'])
             
-            # most largeDCAtranslated
+            # Cap DCA size by risk level
             max_dca_ratio = {
-                'low': 0.15,      # low risk most15%translated
-                'medium': 0.10,   # medium risk10%translated  
-                'high': 0.05      # high risk5%translated
+                'low': 0.15,
+                'medium': 0.10,
+                'high': 0.05
             }
             
             max_ratio = max_dca_ratio.get(dca_decision['risk_level'], 0.05)
@@ -8799,87 +9006,87 @@ translatedReason: {reason}
             return max(min_stake or 10, final_dca)
             
         except Exception as e:
-            logger.error(f"DCAcalculate {trade.pair}: {e}")
+            logger.error(f"DCA sizing failed for {trade.pair}: {e}")
             return trade.stake_amount * 0.5  # default value
     
     def _dca_risk_validation(self, trade: Trade, dca_amount: float, current_data: dict) -> dict:
-        """DCArisk - most check"""
+        """Run final risk checks before approving a DCA amount."""
         
         risk_check = {
             'approved': True,
             'adjusted_amount': dca_amount,
-            'reason': 'DCArisk check',
+            'reason': 'DCA risk check passed',
             'risk_factors': []
         }
         
         try:
-            # 1. position size risk check
+            # 1. Position-size risk check
             available_balance = self.wallets.get_free(self.config['stake_currency'])
             total_exposure = trade.stake_amount + dca_amount
             exposure_ratio = total_exposure / available_balance
             
-            if exposure_ratio > 0.4:  # 1 not40%translated
+            if exposure_ratio > 0.4:
                 adjustment = 0.4 / exposure_ratio
                 risk_check['adjusted_amount'] = dca_amount * adjustment
-                risk_check['risk_factors'].append(f'position size large，as{adjustment:.1%}')
+                risk_check['risk_factors'].append(f'exposure too large, reduced to {adjustment:.1%}')
             
-            # 2. translatedDCArisk check
-            if trade.nr_of_successful_entries >= 3:  # translatedDCA 3times to up
-                risk_check['adjusted_amount'] *= 0.7  # afterDCAtranslated
-                risk_check['risk_factors'].append('timesDCArisk')
+            # 2. Additional scaling after several DCA entries
+            if trade.nr_of_successful_entries >= 3:
+                risk_check['adjusted_amount'] *= 0.7
+                risk_check['risk_factors'].append('multiple prior DCA entries')
             
             # 3. risk check
             if current_data.get('atr_p', 0.02) > 0.05:  # high volatility
                 risk_check['adjusted_amount'] *= 0.8
                 risk_check['risk_factors'].append('high volatility risk adjustment')
             
-            # 4. drawdown
+            # 4. Portfolio drawdown
             if hasattr(self, 'current_drawdown') and self.current_drawdown > 0.08:
                 risk_check['adjusted_amount'] *= 0.6
-                risk_check['risk_factors'].append('drawdown')
+                risk_check['risk_factors'].append('portfolio drawdown adjustment')
             
-            # 5. most small check
-            min_meaningful_dca = trade.stake_amount * 0.2  # DCAoriginal position size20%
+            # 5. Enforce a minimum meaningful DCA size
+            min_meaningful_dca = trade.stake_amount * 0.2
             if risk_check['adjusted_amount'] < min_meaningful_dca:
                 risk_check['approved'] = False
-                risk_check['reason'] = f'DCAsmall，low most small has${min_meaningful_dca:.2f}'
+                risk_check['reason'] = f'DCA amount too small; minimum meaningful add is ${min_meaningful_dca:.2f}'
             
         except Exception as e:
             risk_check['approved'] = False
-            risk_check['reason'] = f'DCArisk check: {e}'
+            risk_check['reason'] = f'DCA risk validation failed: {e}'
             
         return risk_check
     
     def _log_dca_decision(self, trade: Trade, current_rate: float, current_profit: float,
                          price_deviation: float, dca_decision: dict, dca_amount: float,
                          current_data: dict):
-        """recordDCAday"""
+        """Log the details behind an approved DCA decision."""
         
         try:
             hold_time = datetime.now(timezone.utc) - trade.open_date_utc
             hold_hours = hold_time.total_seconds() / 3600
             
             dca_log = f"""
-==================== DCAtranslated ====================
-time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} | translated: {trade.pair}
-times: level{trade.nr_of_successful_entries + 1}times / most large{self.max_dca_orders}times
+==================== DCA Decision ====================
+Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} | Pair: {trade.pair}
+Entry count: {trade.nr_of_successful_entries + 1} / {self.max_dca_orders}
 
-📊 before:
-├─ price: ${trade.open_rate:.6f}
-├─ before price: ${current_rate:.6f}
-├─ price: {price_deviation:.2%}
-├─ before: {current_profit:.2%}
-├─ time: {hold_hours:.1f}hours
-├─ translated: {'🔻short' if trade.is_short else '🔹long'}
-├─ original position size: ${trade.stake_amount:.2f}
+📊 Trade state:
+├─ Entry price: ${trade.open_rate:.6f}
+├─ Current price: ${current_rate:.6f}
+├─ Price deviation: {price_deviation:.2%}
+├─ Current profit: {current_profit:.2%}
+├─ Hold time: {hold_hours:.1f} hours
+├─ Direction: {'short' if trade.is_short else 'long'}
+├─ Original stake: ${trade.stake_amount:.2f}
 
-🎯 DCAtranslated:
-├─ DCAtranslated: {dca_decision['dca_type']}
-├─ translated: {dca_decision['confidence']:.1%}
-├─ risk level: {dca_decision['risk_level']}
-├─ reason: {' | '.join(dca_decision['technical_reasons'])}
+🎯 DCA decision:
+├─ DCA type: {dca_decision['dca_type']}
+├─ Confidence: {dca_decision['confidence']:.1%}
+├─ Risk level: {dca_decision['risk_level']}
+├─ Technical reasons: {' | '.join(dca_decision['technical_reasons'])}
 
-📋 indicator:
+📋 Indicators:
 ├─ RSI(14): {current_data.get('rsi_14', 50):.1f}
 ├─ trend strength: {current_data.get('trend_strength', 50):.0f}/100
 ├─ momentum score: {current_data.get('momentum_score', 0):.3f}
@@ -8888,29 +9095,29 @@ times: level{trade.nr_of_successful_entries + 1}times / most large{self.max_dca_
 ├─ Bollinger Bands: {current_data.get('bb_position', 0.5):.2f}
 ├─ signal strength: {current_data.get('signal_strength', 0):.1f}
 
-💰 DCAcalculate:
-├─ translated: ${trade.stake_amount:.2f}
-├─ calculate: ${dca_amount:.2f}
-├─ new: {(dca_amount/trade.stake_amount)*100:.0f}%
-├─ position size: ${trade.stake_amount + dca_amount:.2f}
+💰 DCA sizing:
+├─ Original stake: ${trade.stake_amount:.2f}
+├─ DCA amount: ${dca_amount:.2f}
+├─ Add size vs original: {(dca_amount/trade.stake_amount)*100:.0f}%
+├─ New total stake: ${trade.stake_amount + dca_amount:.2f}
 
-🌊 translated:
-├─ market state: {dca_decision['market_conditions'].get('market_state', 'translated')}
-├─ volatility: {'✅translated' if dca_decision['market_conditions'].get('volatility_acceptable', False) else '⚠️high'}
-├─ translated: {'✅translated' if dca_decision['market_conditions'].get('liquidity_sufficient', False) else '⚠️not'}
-├─ translated: {'✅translated' if dca_decision['market_conditions'].get('spread_reasonable', False) else '⚠️large'}
+🌊 Market conditions:
+├─ Market state: {dca_decision['market_conditions'].get('market_state', 'unknown')}
+├─ Volatility: {'acceptable' if dca_decision['market_conditions'].get('volatility_acceptable', False) else 'high'}
+├─ Liquidity: {'sufficient' if dca_decision['market_conditions'].get('liquidity_sufficient', False) else 'weak'}
+├─ Spread: {'reasonable' if dca_decision['market_conditions'].get('spread_reasonable', False) else 'wide'}
 
 =================================================="""
             
             logger.info(dca_log)
             
         except Exception as e:
-            logger.error(f"DCAday record {trade.pair}: {e}")
+            logger.error(f"DCA logging failed for {trade.pair}: {e}")
     
     def track_dca_performance(self, trade: Trade, dca_type: str, dca_amount: float):
-        """translatedDCAtranslated"""
+        """Track DCA usage for later performance review."""
         try:
-            # recordDCAtranslated
+            # Update aggregate DCA counters
             self.dca_performance_tracker['total_dca_count'] += 1
             
             dca_record = {
@@ -9095,16 +9302,16 @@ times: level{trade.nr_of_successful_entries + 1}times / most large{self.max_dca_
                 recent_low = recent_data['low'].min()
                 current_recovery = (current_rate - recent_low) / recent_low
                 
-                # breakout after fast50%as breakout
+                # Treat a 0.5% recovery back above the breakout line as meaningful
                 if (recent_low < supertrend and 
                     current_rate > supertrend and 
-                    current_recovery > 0.005):  # 0.5%translated
+                    current_recovery > 0.005):  # 0.5%
                     return True
                     
                 # Bollinger Bands breakout
                 if (recent_data['low'].min() < bb_lower and 
                     current_rate > bb_lower and
-                    current_rate > recent_data['close'].iloc[-3]):  # translated3translatedKbefore high
+                    current_rate > recent_data['close'].iloc[-3]):  # stronger than the close 3 candles ago
                     return True
             
             # === bearish breakout ===
@@ -9113,16 +9320,16 @@ times: level{trade.nr_of_successful_entries + 1}times / most large{self.max_dca_
                 recent_high = recent_data['high'].max()
                 current_pullback = (recent_high - current_rate) / recent_high
                 
-                # breakout after fast50%as breakout
+                # Treat a 0.5% pullback back below the breakdown line as meaningful
                 if (recent_high > supertrend and 
                     current_rate < supertrend and 
-                    current_pullback > 0.005):  # 0.5%translated
+                    current_pullback > 0.005):  # 0.5%
                     return True
                 
                 # Bollinger Bands breakout
                 if (recent_data['high'].max() > bb_upper and 
                     current_rate < bb_upper and
-                    current_rate < recent_data['close'].iloc[-3]):  # translated3translatedKbefore low
+                    current_rate < recent_data['close'].iloc[-3]):  # weaker than the close 3 candles ago
                     return True
             
             return False
@@ -9131,11 +9338,11 @@ times: level{trade.nr_of_successful_entries + 1}times / most large{self.max_dca_
             logger.warning(f"breakout: {e}")
             return False
     
-    # translated confirm_stoploss_signal
+    # Stoploss confirmation helpers
     
     def _log_trend_protection(self, pair: str, trade: Trade, current_rate: float, 
                             current_profit: float, dataframe: DataFrame):
-        """record trend"""
+        """Log details for a trend-protection decision."""
         
         try:
             current_data = dataframe.iloc[-1]
@@ -9154,65 +9361,76 @@ times: level{trade.nr_of_successful_entries + 1}times / most large{self.max_dca_
                 'atr_multiplier': 1.0
             }
             
-            # calculate new value（before market state）
+            # Placeholder for a future adjusted stoploss value
             suggested_new_stoploss = self.stoploss
             
-            # translated decision_logger day record
+            # Reserved for integration with an external decision logger
             pass
             
         except Exception as e:
-            logger.warning(f"trend day record: {e}")
+            logger.warning(f"Trend-protection logging failed: {e}")
     
     def _log_false_breakout_protection(self, pair: str, trade: Trade, 
                                      current_rate: float, dataframe: DataFrame):
-        """record breakout"""
+        """Log false-breakout protection events."""
         
         try:
-            logger.info(f"🚫 breakout - {pair} to breakout，translated50%")
+            logger.info(f"🚫 False-breakout protection triggered for {pair}; position size reduced to 50%")
             
         except Exception as e:
-            logger.warning(f"breakout day record: {e}")
+            logger.warning(f"False-breakout logging failed: {e}")
     
     # ===== new =====
     
-    # translated _calculate_structure_based_stop 
-    # translated calculate_atr_stop_multiplier - simplified
+    # `_calculate_structure_based_stop` removed in this simplified version
+    # `calculate_atr_stop_multiplier` removed in this simplified version
     
-    # translated calculate_trend_stop_adjustment - simplified
+    # `calculate_trend_stop_adjustment` removed in this simplified version
     
-    # translated calculate_volatility_cluster_stop - simplified
+    # `calculate_volatility_cluster_stop` removed in this simplified version
     
-    # translated calculate_time_decay_stop - simplified
+    # `calculate_time_decay_stop` removed in this simplified version
     
-    # translated calculate_profit_protection_stop - simplified
+    # `calculate_profit_protection_stop` removed in this simplified version
     
-    # translated calculate_volume_stop_adjustment - simplified
+    # `calculate_volume_stop_adjustment` removed in this simplified version
     
-    # translated calculate_microstructure_stop - simplified
+    # `calculate_microstructure_stop` removed in this simplified version
     
-    # translated apply_stoploss_limits - simplified
+    # `apply_stoploss_limits` removed in this simplified version
     
-    # translated get_enhanced_technical_stoploss - simplified
+    # `get_enhanced_technical_stoploss` removed in this simplified version
     
-    # translated custom_exit translated - useROItranslated
+    # `custom_exit` removed; ROI exits are used instead
     
-    # translated _get_detailed_exit_reason translated - simplified
+    # `_get_detailed_exit_reason` removed in this simplified version
     
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float,
                           rate: float, time_in_force: str, current_time: datetime,
                           entry_tag: Optional[str], side: str, **kwargs) -> bool:
-        """confirm"""
+        """Confirm whether a trade entry should be allowed."""
         
         try:
-            # most check
+            # Final entry checks
             
-            # 1. time check (avoid large)
-            # to time
+            # 1. Reserved for time-based filters
             
-            # 2. check
+            # 2. Orderbook quality check
             orderbook_data = self.get_market_orderbook(pair)
-            if orderbook_data['spread_pct'] > 0.3:  # large
-                logger.warning(f"large，translated: {pair}")
+            if orderbook_data['spread_pct'] > 0.3:
+                logger.warning(f"Rejecting trade entry for {pair}: spread too wide")
+                return False
+
+            news_signal = self._get_news_signal(pair, current_time)
+            if news_signal and news_signal.backend_available and news_signal.block_entries:
+                logger.warning(
+                    "Blocking trade entry for %s due to news sentiment: sentiment=%.3f impact=%.3f confidence=%.2f reasons=%s",
+                    pair,
+                    news_signal.sentiment_score,
+                    news_signal.impact_score,
+                    news_signal.confidence,
+                    "; ".join(news_signal.reasons),
+                )
                 return False
             
             # 3. check
