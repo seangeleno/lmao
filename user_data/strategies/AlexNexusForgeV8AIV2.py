@@ -1,25 +1,27 @@
 import logging
+import os
+import pickle
+import re
+import warnings
+from datetime import datetime, timedelta, timezone
+from importlib import metadata
+from pathlib import Path
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
-import pickle
-import warnings
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, Dict
-from importlib import metadata
-from functools import lru_cache
 import talib.abstract as ta
 from scipy.fft import fft, fftfreq
-from scipy.stats import skew, kurtosis
-import freqtrade.vendor.qtpylib.indicators as qtpylib
 from freqtrade.strategy import (
     IStrategy,
     DecimalParameter,
     IntParameter,
     BooleanParameter,
+    stoploss_from_open,
 )
 from freqtrade.persistence import Trade
+from freqtrade.enums import RunMode
+from freqtrade.exchange import timeframe_to_seconds
 
 # Suppress deprecation warnings globally
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -34,13 +36,20 @@ try:
         GradientBoostingClassifier,
         ExtraTreesClassifier,
         AdaBoostClassifier,
-        VotingClassifier,
     )
+    from sklearn.base import clone
     from sklearn.linear_model import LogisticRegression
     from sklearn.svm import SVC
-    from sklearn.preprocessing import StandardScaler, RobustScaler
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-    from sklearn.model_selection import cross_val_score, GridSearchCV
+    from sklearn.preprocessing import RobustScaler
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        f1_score,
+        roc_auc_score,
+        average_precision_score,
+    )
+    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
     from sklearn.feature_selection import SelectKBest, f_classif
 
     SKLEARN_AVAILABLE = True
@@ -69,7 +78,6 @@ try:
 except ImportError as e:
     logger.warning(f"PyWavelets not available: {e}")
     WAVELETS_AVAILABLE = False
-logger = logging.getLogger(__name__)
 
 # Define Murrey Math level names for consistency
 MML_LEVEL_NAMES = [
@@ -134,6 +142,8 @@ def calc_slope_advanced(series, period):
         return 0
 
     try:
+        coeffs = None
+        use_level = 0
         # === 1. WAVELET DENOISING ===
         if WAVELETS_AVAILABLE and len(y) >= 8:
             wavelet = "db4"
@@ -192,13 +202,13 @@ def calc_slope_advanced(series, period):
         slope_denoised = np.polyfit(x, y_denoised, 1)[0]
 
         # === 4. WAVELET-BASED TREND DECOMPOSITION ===
-        if WAVELETS_AVAILABLE and len(y) >= 8:
-            # Extract trend component using wavelet approximation
+        # Only when step 1 actually decomposed the series. The old code referenced
+        # `coeffs` even when it was never created and always reconstructed at
+        # level=3 regardless of the decomposition level actually used.
+        if coeffs is not None and use_level >= 1:
             approx_coeffs = coeffs[0]  # Approximation coefficients (trend)
-
-            # Reconstruct trend component
             trend_component = pywt.upcoef(
-                "a", approx_coeffs, wavelet, level=3, take=len(y)
+                "a", approx_coeffs, wavelet, level=use_level, take=len(y)
             )
             if len(trend_component) > len(y):
                 trend_component = trend_component[: len(y)]
@@ -536,555 +546,439 @@ def calculate_advanced_trend_strength_with_wavelets(
             "high_confidence_trend",
         ]
 
+        bool_columns = {
+            "strong_uptrend_advanced",
+            "strong_downtrend_advanced",
+            "ranging_advanced",
+            "high_confidence_trend",
+        }
         for col in fallback_columns:
-            if "strength" in col:
-                dataframe[col] = 0.0
-            else:
-                dataframe[col] = False
+            dataframe[col] = False if col in bool_columns else 0.0
 
         return dataframe
 
 
 # === ADVANCED PREDICTIVE ANALYSIS SYSTEM ===
 
+# Columns that must never be used as ML features: raw OHLCV, signal columns, and
+# non-stationary absolute price / volume levels (they make tree models memorise the
+# price range of the training window instead of learning patterns).
+FEATURE_EXCLUDE_EXACT = {
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "date",
+    "enter_long",
+    "enter_short",
+    "exit_long",
+    "exit_short",
+    "enter_tag",
+    "exit_tag",
+    "entry_type",
+    "btc_close",
+    "ha_close",
+    "ema50",
+    "ema100",
+    "atr",
+    "minima_sort_threshold",
+    "maxima_sort_threshold",
+    "volatility_range",
+    "avg_volatility",
+    "avg_volume",
+    "volume_sma20",
+    "volume_sma50",
+    "vpt",
+    "market_impact",
+    "slope_5",
+    "slope_10",
+    "slope_20",
+    "slope_5_advanced",
+    "slope_10_advanced",
+    "slope_20_advanced",
+    "heisenberg_uncertainty",
+    *MML_LEVEL_NAMES,
+}
+FEATURE_EXCLUDE_PREFIXES = (
+    "_ext_",  # per-candidate extrema columns precomputed for hyperopt
+    "enter_",
+    "exit_",
+    "ml_",
+    "quantum_",
+    "neural_",
+    "momentum_entanglement",
+    "pattern_prediction",
+)
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now (datetime.utcnow() is deprecated since Python 3.12)."""
+    return datetime.now(timezone.utc)
+
 
 class AdvancedPredictiveEngine:
     """
-    Advanced machine learning engine for high-precision trade entry prediction
+    Machine learning engine for trade entry prediction.
+
+    One model bundle is kept per (pair, direction). "long" models predict the
+    probability of a profitable up-move, "short" models the probability of a
+    profitable down-move. Bundles are persisted as a single pickle per key and
+    loaded lazily the first time a pair is seen.
     """
 
-    def __init__(self):
-        # Model containers
-        self.models = {}
-        self.scalers = {}
-        self.feature_importance = {}
-        self.prediction_history = {}
-        self.is_trained = {}
+    MODEL_VERSION = 2
 
-        # Cached training dataframe per pair for incremental extension
-        self.training_cache: dict[str, pd.DataFrame] = {}
-
-        # Retraining control
+    def __init__(self, models_dir: Optional[Path] = None):
+        # Per-key state, key = "<pair>|<direction>"
+        self.models: dict[str, dict] = {}
+        self.model_weights: dict[str, dict[str, float]] = {}
+        self.scalers: dict[str, object] = {}
+        self.feature_columns: dict[str, list[str]] = {}
+        self.metrics: dict[str, dict] = {}
+        self.skill_factor: dict[str, float] = {}
+        self.is_trained: dict[str, bool] = {}
         self.last_train_time: dict[str, datetime] = {}
-        self.last_train_index: dict[str, int] = {}
-        # Periodic retraining interval (changed from 24h to 48h per latest requirement)
+        self._load_attempted: set[str] = set()
+        self._wf_cache: dict[tuple, tuple[pd.Series, pd.Series, pd.Series]] = {}
+
+        # Training configuration
         self.retrain_interval_hours: int = 48
-        self.initial_train_candles: int = 1000  # initial window size
-        self.min_new_candles_for_retrain: int = 50  # skip tiny updates
+        self.initial_train_candles: int = 1000  # rolling training window
+        self.forward_periods: int = 5  # label horizon (candles)
+        self.min_train_rows: int = 300
+        self.max_features: int = 30
+        self.live_fast_mode: bool = False  # True = skip hyper-parameter search live
+        self.backtest_retrain_step: int = 720  # walk-forward retrain every N candles
+        self.refit_on_full_window: bool = True  # refit on train+test after evaluation
 
-        # Strategy startup tracking for 48h retrain rule
-        self.strategy_start_time: datetime = datetime.utcnow()
-        self.retrain_after_startup_hours: int = 48
+        self.models_dir = (
+            Path(models_dir) if models_dir else Path("user_data/strategies/ml_models")
+        )
 
-        # Enable periodic retrain after startup period
-        self.enable_startup_retrain: bool = True
+    # ----------------- PATHS / PERSISTENCE -----------------
+    def set_models_dir(self, models_dir: Path) -> None:
+        self.models_dir = Path(models_dir)
 
-        # Model persistence settings
-        self.models_dir = Path("user_data/strategies/ml_models")
-        self.models_dir.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _key(pair: str, direction: str) -> str:
+        return f"{pair}|{direction}"
 
-        # Load existing models if available
-        self._load_models_from_disk()
+    def _bundle_path(self, pair: str, direction: str) -> Path:
+        safe_pair = re.sub(r"[^A-Za-z0-9]+", "_", pair).strip("_")
+        return self.models_dir / f"{safe_pair}_{direction}_bundle_v{self.MODEL_VERSION}.pkl"
 
-    # ----------------- ASSET EXISTENCE HELPERS -----------------
-    def _required_asset_paths(self, pair: str) -> list[Path]:
-        """Return list of required core asset file paths for a pair."""
-        return [
-            self._get_model_filepath(pair, "model_random_forest"),
-            self._get_model_filepath(pair, "model_gradient_boosting"),
-            self._get_model_filepath(pair, "scaler"),
-            self._get_model_filepath(pair, "metadata"),
-        ]
-
-    def _assets_exist(self, pair: str) -> bool:
-        """Check if all required asset files exist for pair."""
-        return all(p.exists() for p in self._required_asset_paths(pair))
-
-    def mark_trained_if_assets(self, pair: str):
-        """Mark pair as trained if asset files exist (called at startup)."""
-        if self._assets_exist(pair):
-            self.is_trained[pair] = True
-
-    def _get_model_filepath(self, pair: str, model_type: str) -> Path:
-        """Get the filepath for saving/loading models"""
-        safe_pair = pair.replace("/", "_").replace(":", "_")
-        return self.models_dir / f"{safe_pair}_{model_type}.pkl"
-
-    def _save_models_to_disk(self, pair: str):
-        """Save trained models to disk for persistence"""
+    def _save_bundle(self, pair: str, direction: str) -> None:
+        key = self._key(pair, direction)
         try:
-            if pair not in self.models:
-                return
-
-            # Save models
-            for model_name, model in self.models[pair].items():
-                filepath = self._get_model_filepath(pair, f"model_{model_name}")
-                with open(filepath, "wb") as f:
-                    pickle.dump(model, f)
-
-            # Save scaler
-            if pair in self.scalers:
-                scaler_filepath = self._get_model_filepath(pair, "scaler")
-                with open(scaler_filepath, "wb") as f:
-                    pickle.dump(self.scalers[pair], f)
-
-            # Save feature importance and metadata
-            if pair in self.feature_importance:
-                metadata_filepath = self._get_model_filepath(pair, "metadata")
-                metadata = {
-                    "feature_importance": self.feature_importance[pair],
-                    "is_trained": self.is_trained.get(pair, False),
-                    "timestamp": datetime.now().isoformat(),
-                }
-                with open(metadata_filepath, "wb") as f:
-                    pickle.dump(metadata, f)
-
-            logger.info(f"Models saved to disk for {pair}")
-
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            bundle = {
+                "version": self.MODEL_VERSION,
+                "pair": pair,
+                "direction": direction,
+                "models": self.models[key],
+                "weights": self.model_weights[key],
+                "scaler": self.scalers[key],
+                "feature_columns": self.feature_columns[key],
+                "metrics": self.metrics.get(key, {}),
+                "skill_factor": self.skill_factor.get(key, 1.0),
+                "timestamp": self.last_train_time[key].isoformat(),
+            }
+            path = self._bundle_path(pair, direction)
+            tmp_path = path.with_suffix(".tmp")
+            with open(tmp_path, "wb") as f:
+                pickle.dump(bundle, f)
+            os.replace(tmp_path, path)  # atomic: never leaves a half-written model
+            logger.info(f"[ML] Saved {direction} model bundle for {pair} -> {path.name}")
         except Exception as e:
-            logger.warning(f"Failed to save models for {pair}: {e}")
+            logger.warning(f"[ML] Failed to save models for {key}: {e}")
 
-    def _load_models_from_disk(self):
-        """Load existing models from disk"""
+    def _ensure_loaded(self, pair: str, direction: str) -> None:
+        key = self._key(pair, direction)
+        if key in self._load_attempted:
+            return
+        self._load_attempted.add(key)
+        path = self._bundle_path(pair, direction)
+        if not path.exists():
+            return
+        try:
+            with open(path, "rb") as f:
+                bundle = pickle.load(f)
+            if bundle.get("version") != self.MODEL_VERSION:
+                logger.info(f"[ML] Ignoring outdated model bundle {path.name}")
+                return
+            self.models[key] = bundle["models"]
+            self.model_weights[key] = bundle["weights"]
+            self.scalers[key] = bundle["scaler"]
+            self.feature_columns[key] = bundle["feature_columns"]
+            self.metrics[key] = bundle.get("metrics", {})
+            self.skill_factor[key] = bundle.get("skill_factor", 1.0)
+            ts = datetime.fromisoformat(bundle["timestamp"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            self.last_train_time[key] = ts
+            self.is_trained[key] = True
+            logger.info(f"[ML] Loaded {direction} model bundle for {pair} (trained {ts})")
+        except Exception as e:
+            logger.warning(f"[ML] Failed to load model bundle {path.name}: {e}")
+
+    def cleanup_old_models(self, max_age_days: int = 7) -> None:
+        """Remove model files older than max_age_days."""
         try:
             if not self.models_dir.exists():
                 return
-
-            # Find all model files
-            model_files = list(self.models_dir.glob("*_model_*.pkl"))
-
-            pairs_found = set()
-            for model_file in model_files:
-                # Extract pair name from filename
-                filename = model_file.stem
-                parts = filename.split("_model_")
-                if len(parts) == 2:
-                    pair_safe = parts[0]
-                    pair = pair_safe.replace("_", "/")
-                    if ":" not in pair and len(parts[0].split("_")) > 1:
-                        # Handle cases like BTC_USDT_USDT -> BTC/USDT:USDT
-                        parts_pair = parts[0].split("_")
-                        if len(parts_pair) >= 3:
-                            pair = f"{parts_pair[0]}/{parts_pair[1]}:{parts_pair[2]}"
-                    pairs_found.add(pair)
-
-            # Load models for each pair
-            for pair in pairs_found:
-                try:
-                    self._load_pair_models(pair)
-                except Exception as e:
-                    logger.warning(f"Failed to load models for {pair}: {e}")
-
-            if pairs_found:
-                logger.info(
-                    f"Loaded ML models from disk for {len(pairs_found)} pairs: {list(pairs_found)}"
-                )
-
-        except Exception as e:
-            logger.warning(f"Failed to load models from disk: {e}")
-
-    def _load_pair_models(self, pair: str):
-        """Load models for a specific pair"""
-        safe_pair = pair.replace("/", "_").replace(":", "_")
-
-        # Load models
-        models = {}
-        for model_name in ["random_forest", "gradient_boosting"]:
-            model_filepath = self._get_model_filepath(pair, f"model_{model_name}")
-            if model_filepath.exists():
-                with open(model_filepath, "rb") as f:
-                    models[model_name] = pickle.load(f)
-
-        if models:
-            self.models[pair] = models
-
-        # Load scaler
-        scaler_filepath = self._get_model_filepath(pair, "scaler")
-        if scaler_filepath.exists():
-            with open(scaler_filepath, "rb") as f:
-                self.scalers[pair] = pickle.load(f)
-
-        # Load metadata
-        metadata_filepath = self._get_model_filepath(pair, "metadata")
-        if metadata_filepath.exists():
-            with open(metadata_filepath, "rb") as f:
-                metadata = pickle.load(f)
-                self.feature_importance[pair] = metadata.get("feature_importance", {})
-                self.is_trained[pair] = metadata.get("is_trained", False)
-
-    def _cleanup_old_models(self, max_age_days: int = 7):
-        """Remove models older than specified days"""
-        try:
-            cutoff_time = datetime.now() - pd.Timedelta(days=max_age_days)
-
+            cutoff = _utcnow().timestamp() - max_age_days * 86400
             for model_file in self.models_dir.glob("*.pkl"):
-                if model_file.stat().st_mtime < cutoff_time.timestamp():
+                if model_file.stat().st_mtime < cutoff:
                     model_file.unlink()
-                    logger.info(f"Removed old model file: {model_file.name}")
-
+                    logger.info(f"[ML] Removed old model file: {model_file.name}")
         except Exception as e:
-            logger.warning(f"Failed to cleanup old models: {e}")
+            logger.warning(f"[ML] Failed to cleanup old models: {e}")
 
-    def extract_advanced_features(
-        self, dataframe: pd.DataFrame, lookback: int = 100
-    ) -> pd.DataFrame:
-        """Extract sophisticated features for ML prediction with variance validation"""
+    def has_model(self, pair: str, direction: str = "long") -> bool:
+        self._ensure_loaded(pair, direction)
+        return self.is_trained.get(self._key(pair, direction), False)
+
+    def needs_training(self, pair: str, direction: str, now: Optional[datetime] = None) -> bool:
+        """True if no model exists or the existing one is older than retrain_interval_hours."""
+        key = self._key(pair, direction)
+        self._ensure_loaded(pair, direction)
+        if not self.is_trained.get(key, False):
+            return True
+        now = now or _utcnow()
+        last = self.last_train_time.get(key)
+        if last is None:
+            return True
+        return (now - last).total_seconds() / 3600.0 >= self.retrain_interval_hours
+
+    # ----------------- FEATURE ENGINEERING -----------------
+    def extract_advanced_features(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        """Extract features for ML prediction. All features use past data only."""
         df = dataframe.copy()
+        new_cols: dict[str, pd.Series] = {}
 
-        # === 1. ENHANCED PRICE ACTION FEATURES ===
-        # Multi-period price patterns with variance
+        close = df["close"]
+        returns = close.pct_change(1)
+
+        # === 1. PRICE ACTION ===
         for period in [1, 2, 3, 5]:
-            df[f"price_velocity_{period}"] = df["close"].pct_change(period)
-            df[f"price_acceleration_{period}"] = df[f"price_velocity_{period}"].diff(1)
+            vel = close.pct_change(period)
+            new_cols[f"price_velocity_{period}"] = vel
+            new_cols[f"price_acceleration_{period}"] = vel.diff(1)
+            new_cols[f"price_velocity_std_{period}"] = vel.rolling(20).std()
+            new_cols[f"price_velocity_skew_{period}"] = vel.rolling(20).skew()
 
-            # Add rolling statistics for variance
-            df[f"price_velocity_std_{period}"] = (
-                df[f"price_velocity_{period}"].rolling(20).std()
-            )
-            df[f"price_velocity_skew_{period}"] = (
-                df[f"price_velocity_{period}"].rolling(20).skew()
-            )
-
-        # Volatility-adjusted momentum
-        returns = df["close"].pct_change(1)
         vol_20 = returns.rolling(20).std()
-        df["vol_adjusted_momentum"] = returns / (vol_20 + 1e-10)
+        new_cols["vol_adjusted_momentum"] = returns / (vol_20 + 1e-10)
+        if "atr" in df.columns:
+            new_cols["atr_pct"] = df["atr"] / (close + 1e-10)
 
-        # Price position within recent range
         for window in [10, 20, 50]:
             high_window = df["high"].rolling(window).max()
             low_window = df["low"].rolling(window).min()
-            range_size = high_window - low_window
-            df[f"price_position_{window}"] = (df["close"] - low_window) / (
-                range_size + 1e-10
+            new_cols[f"price_position_{window}"] = (close - low_window) / (
+                high_window - low_window + 1e-10
             )
 
-        # Support/Resistance with dynamic thresholds
+        # Support / resistance distance. (The old version filled these with
+        # np.random noise when the columns were missing, which made training and
+        # prediction non-deterministic. They are now simply skipped.)
         if "minima_sort_threshold" in df.columns:
-            support_distance = abs(df["low"] - df["minima_sort_threshold"]) / (
-                df["close"] + 1e-10
-            )
-            df["support_strength"] = (
-                (support_distance < 0.02).astype(int).rolling(20).mean()
-            )
-            df["support_distance_norm"] = support_distance
-        else:
-            df["support_strength"] = np.random.uniform(
-                0.3, 0.7, len(df)
-            )  # Random baseline
-            df["support_distance_norm"] = np.random.uniform(0, 0.1, len(df))
-
+            support_distance = (df["low"] - df["minima_sort_threshold"]).abs() / (close + 1e-10)
+            new_cols["sr_support_strength"] = (support_distance < 0.02).astype(int).rolling(20).mean()
+            new_cols["support_distance_norm"] = support_distance
         if "maxima_sort_threshold" in df.columns:
-            resistance_distance = abs(df["high"] - df["maxima_sort_threshold"]) / (
-                df["close"] + 1e-10
-            )
-            df["resistance_strength"] = (
+            resistance_distance = (df["high"] - df["maxima_sort_threshold"]).abs() / (close + 1e-10)
+            new_cols["sr_resistance_strength"] = (
                 (resistance_distance < 0.02).astype(int).rolling(20).mean()
             )
-            df["resistance_distance_norm"] = resistance_distance
-        else:
-            df["resistance_strength"] = np.random.uniform(0.3, 0.7, len(df))
-            df["resistance_distance_norm"] = np.random.uniform(0, 0.1, len(df))
+            new_cols["resistance_distance_norm"] = resistance_distance
 
         # === 2. VOLUME DYNAMICS ===
-        # Volume profile analysis
-        df["volume_profile_score"] = self._calculate_volume_profile_score(df)
-        df["volume_imbalance"] = self._calculate_volume_imbalance(df)
-        df["smart_money_index"] = self._calculate_smart_money_index(df)
-
-        # Volume-price correlation
-        df["volume_price_correlation"] = df["volume"].rolling(20).corr(df["close"])
-        df["volume_breakout_strength"] = self._calculate_volume_breakout_strength(df)
+        new_cols["volume_profile_score"] = self._calculate_volume_profile_score(df)
+        new_cols["volume_imbalance"] = self._calculate_volume_imbalance(df)
+        new_cols["smart_money_index"] = self._calculate_smart_money_index(df)
+        new_cols["volume_price_correlation"] = df["volume"].rolling(20).corr(close)
+        new_cols["volume_breakout_strength"] = self._calculate_volume_breakout_strength(df)
 
         # === 3. VOLATILITY CLUSTERING ===
-        df["volatility_regime"] = self._calculate_volatility_regime(df)
-        df["volatility_persistence"] = self._calculate_volatility_persistence(df)
-        df["volatility_mean_reversion"] = self._calculate_volatility_mean_reversion(df)
+        new_cols["volatility_regime"] = self._calculate_volatility_regime(df)
+        new_cols["volatility_persistence"] = self._calculate_volatility_persistence(df)
+        new_cols["volatility_mean_reversion"] = self._calculate_volatility_mean_reversion(df)
 
         # === 4. MOMENTUM DECOMPOSITION ===
         for period in [3, 5, 8, 13, 21]:
-            df[f"momentum_{period}"] = df["close"].pct_change(period)
-            df[f"momentum_strength_{period}"] = abs(df[f"momentum_{period}"])
-            df[f"momentum_consistency_{period}"] = (
-                np.sign(df[f"momentum_{period}"]).rolling(5).mean()
-            )
+            mom = close.pct_change(period)
+            new_cols[f"momentum_{period}"] = mom
+            new_cols[f"momentum_strength_{period}"] = mom.abs()
+            new_cols[f"momentum_consistency_{period}"] = np.sign(mom).rolling(5).mean()
 
-        # Momentum regime detection
-        df["momentum_regime"] = self._classify_momentum_regime(df)
-        df["momentum_divergence_strength"] = self._calculate_momentum_divergence(df)
+        new_cols["momentum_regime"] = self._classify_momentum_regime(df)
+        new_cols["momentum_divergence_strength"] = self._calculate_momentum_divergence(df)
 
-        # === 5. MICROSTRUCTURE FEATURES ===
-        df["spread_proxy"] = (df["high"] - df["low"]) / df["close"]
-        df["market_impact"] = df["volume"] * df["spread_proxy"]
-        df["order_flow_imbalance"] = self._calculate_order_flow_imbalance(df)
-        df["liquidity_index"] = self._calculate_liquidity_index(df)
+        # === 5. MICROSTRUCTURE ===
+        spread_proxy = (df["high"] - df["low"]) / close
+        new_cols["spread_proxy"] = spread_proxy
+        new_cols["order_flow_imbalance"] = self._calculate_order_flow_imbalance(df)
+        new_cols["liquidity_index"] = self._calculate_liquidity_index(df)
 
-        # === 6. STATISTICAL FEATURES ===
+        # === 6. STATISTICAL FEATURES (vectorised, much faster than rolling.apply) ===
         for window in [10, 20, 50]:
-            returns = df["close"].pct_change(1)
-            df[f"skewness_{window}"] = returns.rolling(window).apply(
-                lambda x: skew(x.dropna()) if len(x.dropna()) > 3 else 0
-            )
-            df[f"kurtosis_{window}"] = returns.rolling(window).apply(
-                lambda x: kurtosis(x.dropna()) if len(x.dropna()) > 3 else 0
-            )
-            df[f"entropy_{window}"] = self._calculate_entropy(df["close"], window)
+            new_cols[f"skewness_{window}"] = returns.rolling(window).skew()
+            new_cols[f"kurtosis_{window}"] = returns.rolling(window).kurt()
+            new_cols[f"entropy_{window}"] = self._calculate_entropy(close, window)
 
-        # === 7. REGIME DETECTION FEATURES ===
-        df["market_regime"] = self._detect_market_regime(df)
-        df["regime_stability"] = self._calculate_regime_stability(df)
-        df["regime_transition_probability"] = self._calculate_regime_transition_prob(df)
+        # === 7. REGIME DETECTION ===
+        regime = self._detect_market_regime(df)
+        new_cols["market_regime"] = regime
+        regime_changes = regime.diff(1).abs()
+        new_cols["regime_stability"] = 1 / (regime_changes.rolling(20).mean() + 1e-3)
+        new_cols["regime_transition_probability"] = (
+            (regime_changes > 0.5).astype(int).rolling(20).mean()
+        )
 
+        # Assign all at once (avoids pandas fragmentation warnings and is faster)
+        new_df = pd.DataFrame(new_cols, index=df.index)
+        df = pd.concat([df.drop(columns=[c for c in new_df.columns if c in df.columns]), new_df], axis=1)
         return df
 
-    def _calculate_volume_profile_score(
-        self, df: pd.DataFrame, window: int = 50
-    ) -> pd.Series:
-        """Calculate volume profile score"""
-
-        def volume_profile(data):
-            if len(data) < 10:
-                return 0.5
-
-            prices = data["close"].values
-            volumes = data["volume"].values
-
-            # Create price bins
+    def _calculate_volume_profile_score(self, df: pd.DataFrame, window: int = 50) -> pd.Series:
+        """Distance of price from the rolling volume Point of Control (1 = at POC)."""
+        prices_all = df["close"].to_numpy(dtype=float)
+        volumes_all = df["volume"].to_numpy(dtype=float)
+        result = np.full(len(df), 0.5)
+        for i in range(window, len(df)):
+            prices = prices_all[i - window + 1 : i + 1]
+            volumes = volumes_all[i - window + 1 : i + 1]
             price_min, price_max = prices.min(), prices.max()
             if price_max == price_min:
-                return 0.5
-
+                continue
             bins = np.linspace(price_min, price_max, 10)
-
-            # Calculate volume at each price level
-            volume_at_price = []
-            for i in range(len(bins) - 1):
-                mask = (prices >= bins[i]) & (prices < bins[i + 1])
-                vol_sum = volumes[mask].sum()
-                volume_at_price.append(vol_sum)
-
-            # Point of Control (POC) - price level with highest volume
-            if sum(volume_at_price) == 0:
-                return 0.5
-
-            poc_index = np.argmax(volume_at_price)
-            current_price = prices[-1]
+            vol_at_price, _ = np.histogram(prices, bins=bins, weights=volumes)
+            if vol_at_price.sum() == 0:
+                continue
+            poc_index = int(np.argmax(vol_at_price))
             poc_price = (bins[poc_index] + bins[poc_index + 1]) / 2
-
-            # Score based on distance from POC
-            distance_ratio = abs(current_price - poc_price) / (
-                price_max - price_min + 1e-10
-            )
-            score = 1 - distance_ratio  # Closer to POC = higher score
-
-            return max(0, min(1, score))
-
-        # Apply rolling calculation
-        result = []
-        for i in range(len(df)):
-            if i < window:
-                result.append(0.5)
-            else:
-                window_data = df.iloc[i - window + 1 : i + 1][["close", "volume"]]
-                score = volume_profile(window_data)
-                result.append(score)
-
+            distance_ratio = abs(prices[-1] - poc_price) / (price_max - price_min + 1e-10)
+            result[i] = max(0.0, min(1.0, 1 - distance_ratio))
         return pd.Series(result, index=df.index)
 
     def _calculate_volume_imbalance(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate volume imbalance between buying and selling"""
         up_volume = df["volume"].where(df["close"] > df["open"], 0)
         down_volume = df["volume"].where(df["close"] < df["open"], 0)
-
-        total_volume = up_volume + down_volume
-        imbalance = (up_volume - down_volume) / (total_volume + 1e-10)
-
+        imbalance = (up_volume - down_volume) / (up_volume + down_volume + 1e-10)
         return imbalance.rolling(10).mean()
 
     def _calculate_smart_money_index(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate Smart Money Index (SMI)"""
-        price_change = abs(df["close"].pct_change(1))
-        volume_norm = df["volume"] / df["volume"].rolling(20).mean()
-
-        smi = volume_norm / (price_change + 1e-10)
+        price_change = df["close"].pct_change(1).abs()
+        volume_norm = df["volume"] / (df["volume"].rolling(20).mean() + 1e-10)
+        # log1p keeps the ratio from exploding on near-zero price changes
+        smi = np.log1p(volume_norm / (price_change + 1e-4))
         return smi.rolling(10).mean()
 
     def _calculate_volume_breakout_strength(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate volume breakout strength"""
-        volume_ma = df["volume"].rolling(20).mean()
-        volume_ratio = df["volume"] / volume_ma
-
+        volume_ratio = df["volume"] / (df["volume"].rolling(20).mean() + 1e-10)
         price_breakout = (
             (df["close"] > df["close"].rolling(20).max().shift(1))
             | (df["close"] < df["close"].rolling(20).min().shift(1))
         ).astype(int)
-
-        breakout_strength = volume_ratio * price_breakout
-        return breakout_strength.rolling(5).mean()
+        return (volume_ratio * price_breakout).rolling(5).mean()
 
     def _calculate_volatility_regime(self, df: pd.DataFrame) -> pd.Series:
-        """Detect volatility regime"""
-        returns = df["close"].pct_change(1)
-        volatility = returns.rolling(20).std()
+        volatility = df["close"].pct_change(1).rolling(20).std()
         vol_ma = volatility.rolling(50).mean()
-
-        regime = pd.Series(1, index=df.index)  # Default normal
-        regime[volatility < vol_ma * 0.7] = 0  # Low volatility
-        regime[volatility > vol_ma * 1.5] = 2  # High volatility
-
+        regime = pd.Series(1, index=df.index)
+        regime[volatility < vol_ma * 0.7] = 0
+        regime[volatility > vol_ma * 1.5] = 2
         return regime
 
     def _calculate_volatility_persistence(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate volatility persistence"""
-        returns = df["close"].pct_change(1)
-        volatility = returns.rolling(5).std()
-
-        persistence = volatility.rolling(20).apply(
-            lambda x: x.autocorr(lag=1) if len(x.dropna()) > 10 else 0
-        )
-
-        return persistence
+        volatility = df["close"].pct_change(1).rolling(5).std()
+        # Rolling lag-1 autocorrelation, vectorised
+        return volatility.rolling(20).corr(volatility.shift(1))
 
     def _calculate_volatility_mean_reversion(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate volatility mean reversion tendency"""
-        returns = df["close"].pct_change(1)
-        volatility = returns.rolling(10).std()
+        volatility = df["close"].pct_change(1).rolling(10).std()
         vol_ma = volatility.rolling(50).mean()
-
-        vol_zscore = (volatility - vol_ma) / (volatility.rolling(50).std() + 1e-10)
-        mean_reversion = -vol_zscore
-
-        return mean_reversion
+        return -(volatility - vol_ma) / (volatility.rolling(50).std() + 1e-10)
 
     def _classify_momentum_regime(self, df: pd.DataFrame) -> pd.Series:
-        """Classify momentum regime"""
         mom_3 = df["close"].pct_change(3)
         mom_8 = df["close"].pct_change(8)
         mom_21 = df["close"].pct_change(21)
-
-        regime = pd.Series(0, index=df.index)  # Neutral
-
+        regime = pd.Series(0, index=df.index)
         strong_up = (mom_3 > 0.02) & (mom_8 > 0.05) & (mom_21 > 0.1)
+        regime[(mom_3 > 0) & (mom_8 > 0) & (mom_21 > 0) & ~strong_up] = 1
         regime[strong_up] = 2
-
-        mod_up = (mom_3 > 0) & (mom_8 > 0) & (mom_21 > 0) & ~strong_up
-        regime[mod_up] = 1
-
-        mod_down = (mom_3 < 0) & (mom_8 < 0) & (mom_21 < 0) & (mom_21 > -0.1)
-        regime[mod_down] = -1
-
         strong_down = (mom_3 < -0.02) & (mom_8 < -0.05) & (mom_21 < -0.1)
+        regime[(mom_3 < 0) & (mom_8 < 0) & (mom_21 < 0) & ~strong_down] = -1
         regime[strong_down] = -2
-
         return regime
 
     def _calculate_momentum_divergence(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate momentum divergence strength"""
         price_momentum = df["close"].pct_change(10)
+        rsi_momentum = df["rsi"].diff(10) if "rsi" in df.columns else pd.Series(0.0, index=df.index)
+        volume_momentum = df["volume"].pct_change(10).replace([np.inf, -np.inf], np.nan)
 
-        if "rsi" in df.columns:
-            rsi_momentum = df["rsi"].diff(10)
-        else:
-            rsi_momentum = pd.Series(0, index=df.index)
+        def zscore(s: pd.Series) -> pd.Series:
+            return (s - s.rolling(50).mean()) / (s.rolling(50).std() + 1e-10)
 
-        volume_momentum = df["volume"].pct_change(10)
-
-        # Normalize momentums using rolling z-score
-        price_norm = (price_momentum - price_momentum.rolling(50).mean()) / (
-            price_momentum.rolling(50).std() + 1e-10
-        )
-        rsi_norm = (rsi_momentum - rsi_momentum.rolling(50).mean()) / (
-            rsi_momentum.rolling(50).std() + 1e-10
-        )
-        volume_norm = (volume_momentum - volume_momentum.rolling(50).mean()) / (
-            volume_momentum.rolling(50).std() + 1e-10
-        )
-
-        price_rsi_div = abs(price_norm - rsi_norm)
-        price_volume_div = abs(price_norm - volume_norm)
-
-        divergence_strength = (price_rsi_div + price_volume_div) / 2
-        return divergence_strength.rolling(5).mean()
+        price_norm = zscore(price_momentum)
+        divergence = ((price_norm - zscore(rsi_momentum)).abs() + (price_norm - zscore(volume_momentum)).abs()) / 2
+        return divergence.rolling(5).mean()
 
     def _calculate_order_flow_imbalance(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate order flow imbalance"""
         price_impact = (df["close"] - df["open"]) / df["open"]
-        volume_impact = df["volume"] / df["volume"].rolling(20).mean()
-
-        flow_imbalance = price_impact * volume_impact
-        return flow_imbalance.rolling(5).mean()
+        volume_impact = df["volume"] / (df["volume"].rolling(20).mean() + 1e-10)
+        return (price_impact * volume_impact).rolling(5).mean()
 
     def _calculate_liquidity_index(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate market liquidity index"""
         spread = (df["high"] - df["low"]) / df["close"]
-        volume_norm = df["volume"] / df["volume"].rolling(50).mean()
-
-        liquidity = volume_norm / (spread + 1e-10)
-        return liquidity.rolling(10).mean()
+        volume_norm = df["volume"] / (df["volume"].rolling(50).mean() + 1e-10)
+        return np.log1p(volume_norm / (spread + 1e-4)).rolling(10).mean()
 
     def _calculate_entropy(self, series: pd.Series, window: int) -> pd.Series:
-        """Calculate information entropy"""
-
-        def entropy(data):
+        def entropy(data: np.ndarray) -> float:
             if len(data) < 5:
-                return 0
-
-            returns = np.diff(data) / (data[:-1] + 1e-10)
-
-            bins = np.histogram_bin_edges(returns, bins=10)
-            hist, _ = np.histogram(returns, bins=bins)
-
+                return 0.0
+            rets = np.diff(data) / (data[:-1] + 1e-10)
+            if not np.isfinite(rets).all() or np.ptp(rets) == 0:
+                return 0.0
+            hist, _ = np.histogram(rets, bins=10)
             probs = hist / (hist.sum() + 1e-10)
             probs = probs[probs > 0]
+            return float(-np.sum(probs * np.log2(probs)))
 
-            ent = -np.sum(probs * np.log2(probs + 1e-10))
-            return ent
-
-        return series.rolling(window).apply(entropy, raw=False)
+        return series.rolling(window).apply(entropy, raw=True)
 
     def _detect_market_regime(self, df: pd.DataFrame) -> pd.Series:
-        """Detect overall market regime"""
-        if "trend_strength" in df.columns:
-            trend_regime = np.sign(df["trend_strength"])
-        else:
-            trend_regime = pd.Series(0, index=df.index)
-
+        trend_regime = (
+            np.sign(df["trend_strength"]) if "trend_strength" in df.columns else pd.Series(0, index=df.index)
+        )
         vol_regime = self._calculate_volatility_regime(df) - 1
         momentum_regime = self._classify_momentum_regime(df)
-
         market_regime = trend_regime * 0.4 + vol_regime * 0.3 + momentum_regime * 0.3
-
         return market_regime.rolling(5).mean()
 
-    def _calculate_regime_stability(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate regime stability"""
-        regime = self._detect_market_regime(df)
-        regime_changes = abs(regime.diff(1))
-        stability = 1 / (regime_changes.rolling(20).mean() + 1e-10)
-        return stability
+    def _candidate_feature_columns(self, feature_df: pd.DataFrame) -> list[str]:
+        cols = []
+        for col in feature_df.columns:
+            if col in FEATURE_EXCLUDE_EXACT or col.startswith(FEATURE_EXCLUDE_PREFIXES):
+                continue
+            if not pd.api.types.is_numeric_dtype(feature_df[col]) or pd.api.types.is_bool_dtype(
+                feature_df[col]
+            ):
+                continue
+            cols.append(col)
+        return cols
 
-    def _calculate_regime_transition_prob(self, df: pd.DataFrame) -> pd.Series:
-        """Calculate probability of regime transition"""
-        regime = self._detect_market_regime(df)
-
-        transitions = []
-        for i in range(1, len(regime)):
-            if not (pd.isna(regime.iloc[i]) or pd.isna(regime.iloc[i - 1])):
-                transition = abs(regime.iloc[i] - regime.iloc[i - 1]) > 0.5
-                transitions.append(transition)
-            else:
-                transitions.append(False)
-
-        transition_prob = pd.Series([False] + transitions, index=regime.index)
-        prob_smooth = transition_prob.astype(int).rolling(20).mean()
-
-        return prob_smooth
-
+    # ----------------- TARGET -----------------
     def create_target_variable(
         self,
         df: pd.DataFrame,
-        forward_periods: int = 5,
-        profit_threshold: float | None = None,
+        direction: str = "long",
+        forward_periods: Optional[int] = None,
+        profit_threshold: Optional[float] = None,
         dynamic: bool = True,
         quantile: float = 0.85,
         k_atr: float = 1.2,
@@ -1092,844 +986,485 @@ class AdvancedPredictiveEngine:
         min_abs: float = 0.003,
         max_abs: float = 0.05,
     ) -> pd.Series:
-        """Create target variable with optional dynamic profit threshold.
+        """Ensemble-vote target. Returns a float Series: 1/0, and NaN where the future
+        is not yet known (last `forward_periods` rows). Those rows used to be filled
+        with 0, i.e. silently labelled as "bad entry"."""
+        fp = forward_periods or self.forward_periods
+        close = df["close"]
+        sign = 1.0 if direction == "long" else -1.0
 
-        Dynamic threshold logic (if dynamic=True and profit_threshold not provided):
-          1. Compute ATR% (14) and rolling return volatility (20).
-          2. base_series = k_atr * ATR% + k_vol * vola20
-          3. base_scalar = median(base_series)
-          4. q_thr = 85th percentile of forward_returns (future move distribution)
-          5. blended = 0.5 * base_scalar + 0.5 * q_thr
-          6. final_thr = clip(blended, min_abs, max_abs)
-        This produces a stable scalar threshold per training batch (reproducible) rather than per-row noise.
-        """
-        # Forward returns used by several strategies
-        forward_returns = (
-            df["close"].pct_change(forward_periods).shift(-forward_periods)
-        )
+        forward_returns = close.shift(-fp) / close - 1
+        gain = sign * forward_returns
+        forward_highs = df["high"].rolling(fp).max().shift(-fp)
+        forward_lows = df["low"].rolling(fp).min().shift(-fp)
+        if direction == "long":
+            potential = (forward_highs - close) / close
+            adverse = ((forward_lows - close) / close).abs()
+        else:
+            potential = (close - forward_lows) / close
+            adverse = ((forward_highs - close) / close).abs()
+        known = forward_returns.notna() & forward_highs.notna() & forward_lows.notna()
 
-        # === DYNAMIC THRESHOLD CALCULATION ===
-        if dynamic and (profit_threshold is None):
+        if profit_threshold is None and dynamic:
             try:
-                # ATR% calculation
-                high = df["high"]
-                low = df["low"]
-                close = df["close"]
                 prev_close = close.shift(1)
                 tr = np.maximum(
-                    high - low,
-                    np.maximum((high - prev_close).abs(), (low - prev_close).abs()),
+                    df["high"] - df["low"],
+                    np.maximum((df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()),
                 )
-                atr = tr.rolling(14).mean()
-                atr_pct = (atr / close).clip(lower=0)
-
-                # Return volatility
-                returns_1 = close.pct_change()
-                vola20 = returns_1.rolling(20).std()
-
-                base_series = k_atr * atr_pct + k_vol * vola20
-                base_scalar = (
-                    float(np.nanmedian(base_series.tail(300)))
-                    if len(base_series.dropna()) > 30
-                    else float(np.nanmedian(base_series))
-                )
-
-                # Distribution-based quantile of forward returns (future info okay for label construction stage)
-                q_thr = (
-                    float(forward_returns.quantile(quantile))
-                    if forward_returns.notna().any()
-                    else min_abs
-                )
+                atr_pct = (tr.rolling(14).mean() / close).clip(lower=0)
+                vola20 = close.pct_change().rolling(20).std()
+                base_series = (k_atr * atr_pct + k_vol * vola20).dropna()
+                base_scalar = float(np.median(base_series.tail(300))) if len(base_series) else min_abs
+                q_thr = float(gain[known].quantile(quantile)) if known.any() else min_abs
                 if not np.isfinite(q_thr):
                     q_thr = min_abs
-                blended = 0.5 * base_scalar + 0.5 * q_thr
-                profit_threshold = float(np.clip(blended, min_abs, max_abs))
+                profit_threshold = float(np.clip(0.5 * base_scalar + 0.5 * q_thr, min_abs, max_abs))
             except Exception as e:
-                logger.warning(
-                    f"Dynamic threshold failed ({e}), falling back to default 0.015"
-                )
+                logger.warning(f"[ML] Dynamic threshold failed ({e}), using 0.015")
                 profit_threshold = 0.015
         elif profit_threshold is None:
             profit_threshold = 0.015
 
-        # === STRATEGY 1: SIMPLE FORWARD RETURNS ===
-        simple_target = (forward_returns > profit_threshold).astype(int)
+        simple_target = (gain > profit_threshold).astype(int)
+        profit_target = (potential > profit_threshold).astype(int)
+        risk_adjusted_return = gain / (adverse + 1e-10)
+        risk_target = ((gain > profit_threshold * 0.7) & (risk_adjusted_return > 0.5)).astype(int)
+        returns_std = close.pct_change().rolling(20).std()
+        vol_target = (gain > profit_threshold * (1 + returns_std)).astype(int)
 
-        # === STRATEGY 2: MAXIMUM PROFIT POTENTIAL ===
-        forward_highs = (
-            df["high"].rolling(forward_periods).max().shift(-forward_periods)
-        )
-        max_profit_potential = (forward_highs - df["close"]) / df["close"]
-        profit_target = (max_profit_potential > profit_threshold).astype(int)
+        final_target = ((simple_target + profit_target + risk_target + vol_target) >= 2).astype(float)
+        final_target[~known] = np.nan
 
-        # === STRATEGY 3: RISK-ADJUSTED RETURNS ===
-        forward_lows = df["low"].rolling(forward_periods).min().shift(-forward_periods)
-        max_loss_potential = (forward_lows - df["close"]) / df["close"]
-        risk_adjusted_return = forward_returns / (abs(max_loss_potential) + 1e-10)
-        risk_target = (
-            (forward_returns > profit_threshold * 0.7) & (risk_adjusted_return > 0.5)
-        ).astype(int)
-
-        # === STRATEGY 4: VOLATILITY-ADJUSTED TARGET ===
-        returns_std = df["close"].pct_change().rolling(20).std()
-        volatility_adjusted_threshold = profit_threshold * (1 + returns_std)
-        vol_target = (forward_returns > volatility_adjusted_threshold).astype(int)
-
-        # === ENSEMBLE VOTE ===
-        combined_target = simple_target + profit_target + risk_target + vol_target
-        final_target = (combined_target >= 2).astype(int)
-
-        positive_ratio = final_target.mean()
+        ratio = final_target.mean()
         logger.info(
-            f"Target created (forward={forward_periods}) dynamic_thr={profit_threshold:.4f} "
-            f"positives={final_target.sum()}/{len(final_target)} ratio={positive_ratio:.3f}"
+            f"[ML] {direction} target (fwd={fp}) thr={profit_threshold:.4f} "
+            f"positives={int(final_target.sum())}/{int(known.sum())} ratio={ratio:.3f}"
         )
-
-        # Only log imbalance now; do not auto-alter labels (professional reproducibility)
-        if positive_ratio < 0.05:
-            logger.warning(
-                f"Very low positive ratio ({positive_ratio:.3f}) at threshold {profit_threshold:.4f}"
-            )
-        elif positive_ratio > 0.45:
-            logger.warning(
-                f"High positive ratio ({positive_ratio:.3f}) at threshold {profit_threshold:.4f}"
-            )
-
         return final_target
 
-    def train_predictive_models(self, df: pd.DataFrame, pair: str) -> dict:
-        """Train advanced ensemble of predictive models with hyperparameter optimization"""
+    # ----------------- TRAINING -----------------
+    def _make_models(self, fast: bool, n_train: int) -> dict:
+        tscv = TimeSeriesSplit(n_splits=3)
+        models: dict = {}
+        if fast:
+            models["random_forest"] = RandomForestClassifier(
+                n_estimators=200, max_depth=10, min_samples_leaf=5, max_features="sqrt",
+                class_weight="balanced_subsample", random_state=42, n_jobs=-1,
+            )
+            models["gradient_boosting"] = GradientBoostingClassifier(
+                n_estimators=150, max_depth=3, learning_rate=0.05, subsample=0.8,
+                min_samples_leaf=10, validation_fraction=0.1, n_iter_no_change=10, random_state=42,
+            )
+        else:
+            models["random_forest"] = RandomizedSearchCV(
+                RandomForestClassifier(random_state=42, n_jobs=-1, class_weight="balanced_subsample"),
+                param_distributions={
+                    "n_estimators": [150, 200, 300],
+                    "max_depth": [6, 10, 15, 20],
+                    "min_samples_split": [5, 10, 20],
+                    "min_samples_leaf": [2, 5, 10],
+                    "max_features": ["sqrt", "log2", 0.5],
+                },
+                n_iter=12, cv=tscv, scoring="average_precision", n_jobs=-1, random_state=42,
+            )
+            models["gradient_boosting"] = RandomizedSearchCV(
+                GradientBoostingClassifier(
+                    random_state=42, validation_fraction=0.1, n_iter_no_change=10, tol=1e-4
+                ),
+                param_distributions={
+                    "n_estimators": [100, 150, 250],
+                    "max_depth": [2, 3, 4, 6],
+                    "learning_rate": [0.03, 0.05, 0.1],
+                    "min_samples_leaf": [5, 10, 20],
+                    "subsample": [0.7, 0.85, 1.0],
+                },
+                n_iter=12, cv=tscv, scoring="average_precision", n_jobs=-1, random_state=42,
+            )
+            if n_train < 2000:
+                models["svm"] = SVC(
+                    kernel="rbf", C=1.0, gamma="scale", probability=True,
+                    random_state=42, class_weight="balanced",
+                )
+        models["extra_trees"] = ExtraTreesClassifier(
+            n_estimators=150, max_depth=12, min_samples_split=8, min_samples_leaf=4,
+            max_features="sqrt", random_state=42, n_jobs=-1, class_weight="balanced",
+        )
+        models["ada_boost"] = AdaBoostClassifier(n_estimators=80, learning_rate=0.8, random_state=42)
+        models["logistic_regression"] = LogisticRegression(
+            C=1.0, solver="liblinear", random_state=42, class_weight="balanced", max_iter=1000,
+        )
+        return models
+
+    def train(
+        self,
+        feature_df: pd.DataFrame,
+        df: pd.DataFrame,
+        pair: str,
+        direction: str = "long",
+        fast: bool = False,
+        persist: bool = True,
+        key_suffix: str = "",
+    ) -> dict:
+        """Train the model ensemble for one pair/direction on the given window."""
         if not SKLEARN_AVAILABLE:
             return {"status": "sklearn_not_available"}
-
+        key = self._key(pair, direction) + key_suffix
+        fp = self.forward_periods
         try:
-            # Decide training slice: initial window or sliding window on retrain
-            if pair not in self.is_trained or not self.is_trained[pair]:
-                # First training: cut to last initial_train_candles
-                if len(df) > self.initial_train_candles:
-                    base_df = df.iloc[-self.initial_train_candles :].copy()
-                else:
-                    base_df = df.copy()
-            else:
-                # Incremental retrain: extend previous cached window with new rows since last_train_index
-                prev_df = self.training_cache.get(pair)
-                if prev_df is None:
-                    prev_df = (
-                        df.iloc[-self.initial_train_candles :].copy()
-                        if len(df) > self.initial_train_candles
-                        else df.copy()
-                    )
-                # New rows (simple index-based diff). If dataframe has 'date', we could filter last 24h.
-                new_rows = df.iloc[self.last_train_index.get(pair, 0) :].copy()
-                if len(new_rows) == 0:
-                    base_df = prev_df
-                else:
-                    combined = pd.concat([prev_df, new_rows], ignore_index=True)
-                    # Keep only most recent window (rolling window behaviour)
-                    if len(combined) > self.initial_train_candles:
-                        base_df = combined.iloc[-self.initial_train_candles :].copy()
-                    else:
-                        base_df = combined
+            target = self.create_target_variable(df, direction=direction)
+            cols = self._candidate_feature_columns(feature_df)
+            X = feature_df[cols].replace([np.inf, -np.inf], np.nan)
 
-            feature_df = self.extract_advanced_features(base_df)
-            target = self.create_target_variable(base_df)
+            # Drop indicator warm-up rows (mostly NaN) and rows with unknown future
+            warm = X.isna().mean(axis=1) < 0.3
+            valid = target.notna() & warm
+            X = X[valid].fillna(0)
+            y = target[valid].astype(int)
 
-            feature_columns = []
-            exclude_cols = [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "date",
-                "enter_long",
-                "enter_short",
-                "exit_long",
-                "exit_short",
-            ]
+            if len(X) < self.min_train_rows:
+                return {"status": "insufficient_data", "rows": len(X)}
 
-            for col in feature_df.columns:
-                if (
-                    col not in exclude_cols
-                    and feature_df[col].dtype in ["float64", "int64"]
-                    and not col.startswith("enter_")
-                    and not col.startswith("exit_")
-                ):
-                    feature_columns.append(col)
-
-            X = feature_df[feature_columns].fillna(0)
-            y = target.fillna(0)
-
-            valid_mask = ~(pd.isna(y) | pd.isna(X).any(axis=1))
-            X = X[valid_mask]
-            y = y[valid_mask]
-
-            if len(X) < 100:
-                return {"status": "insufficient_data"}
-
-            # === FEATURE QUALITY VALIDATION ===
-            # Remove constant features (zero variance)
-            feature_variance = X.var()
-            non_constant_features = feature_variance[
-                feature_variance > 1e-10
-            ].index.tolist()
-
-            logger.info(
-                f"Removed {len(feature_columns) - len(non_constant_features)} "
-                f"constant features out of {len(feature_columns)}"
-            )
-
-            if len(non_constant_features) < 5:
-                logger.warning(
-                    f"Too few variable features ({len(non_constant_features)})"
+            if y.sum() < 10:
+                logger.warning(f"[ML] {key}: only {int(y.sum())} positives, relaxing target")
+                relaxed = self.create_target_variable(
+                    df, direction=direction, forward_periods=3, profit_threshold=0.01
                 )
-                return {"status": "insufficient_features"}
-
-            X = X[non_constant_features]
-            feature_columns = non_constant_features
-
-            # === CLASS BALANCE VALIDATION ===
-            positive_count = y.sum()
-            negative_count = len(y) - positive_count
-            positive_ratio = positive_count / len(y)
-
-            logger.info(
-                f"Class distribution: {positive_count} positive, "
-                f"{negative_count} negative ({positive_ratio:.3f} ratio)"
-            )
-
-            # Check for severe class imbalance
-            if positive_count < 10:
-                logger.warning(
-                    f"Too few positive examples ({positive_count}), "
-                    f"adjusting target variable"
-                )
-                # Create more lenient target
-                relaxed_target = self.create_target_variable(
-                    df, forward_periods=3, profit_threshold=0.01
-                )
-                y = relaxed_target[valid_mask].fillna(0)
-                positive_count = y.sum()
-                positive_ratio = positive_count / len(y)
-                logger.info(
-                    f"Adjusted class distribution: {positive_count} positive "
-                    f"({positive_ratio:.3f} ratio)"
-                )
-
-            if positive_count < 5:
+                y = relaxed.reindex(X.index)
+                keep = y.notna()
+                X, y = X[keep], y[keep].astype(int)
+            if y.sum() < 5 or (len(y) - y.sum()) < 5:
                 return {"status": "insufficient_positive_examples"}
 
-            # Advanced feature selection
-            if len(feature_columns) > 30:
-                selector = SelectKBest(
-                    score_func=f_classif, k=min(30, len(feature_columns))
-                )
-                X_selected = selector.fit_transform(X, y)
-                selected_features = [
-                    feature_columns[i] for i in selector.get_support(indices=True)
-                ]
-                X = pd.DataFrame(X_selected, columns=selected_features, index=X.index)
-                feature_columns = selected_features
-                logger.info(
-                    f"Selected {len(selected_features)} best features for {pair}"
-                )
-
+            # Chronological split with a purge gap so test labels don't overlap train labels
             split_idx = int(len(X) * 0.7)
-            X_train, X_test = X[:split_idx], X[split_idx:]
-            y_train, y_test = y[:split_idx], y[split_idx:]
+            X_train, y_train = X.iloc[: split_idx - fp], y.iloc[: split_idx - fp]
+            X_test, y_test = X.iloc[split_idx:], y.iloc[split_idx:]
+            if y_train.nunique() < 2:
+                return {"status": "single_class_train"}
 
-            # Use RobustScaler for better handling of outliers
+            # Remove constant features (measured on train only)
+            variance = X_train.var()
+            feats = variance[variance > 1e-10].index.tolist()
+            if len(feats) < 5:
+                return {"status": "insufficient_features"}
+
+            # Feature selection fitted on TRAIN only (was fitted on all data -> leakage)
+            if len(feats) > self.max_features:
+                selector = SelectKBest(score_func=f_classif, k=self.max_features)
+                selector.fit(X_train[feats], y_train)
+                feats = [feats[i] for i in selector.get_support(indices=True)]
+
             scaler = RobustScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
+            X_train_s = scaler.fit_transform(X_train[feats])
+            X_test_s = scaler.transform(X_test[feats])
 
-            models = {}
-            results = {}
-
-            # === MODEL 1: OPTIMIZED RANDOM FOREST ===
-            # Full parameter grid for comprehensive optimization
-            rf_params_full = {
-                "n_estimators": [150, 200, 250],
-                "max_depth": [15, 20, 25],
-                "min_samples_split": [5, 10, 15],
-                "min_samples_leaf": [2, 5, 8],
-                "max_features": ["sqrt", "log2", 0.8],
-            }
-
-            # Quick parameter grid for faster training (used by default)
-            rf_params_quick = {
-                "n_estimators": [150, 200],
-                "max_depth": [15, 20],
-                "min_samples_split": [5, 10],
-                "min_samples_leaf": [2, 5],
-                "max_features": ["sqrt", 0.8],
-            }
-
-            rf_base = RandomForestClassifier(
-                random_state=42, n_jobs=-1, class_weight="balanced"
-            )
-
-            # Use comprehensive grid search for datasets with sufficient data
-            use_full_params = len(X_train) > 600  # More data = more thorough search
-            selected_params = rf_params_full if use_full_params else rf_params_quick
-
-            logger.info(
-                f"Using {'full' if use_full_params else 'quick'} RF parameters "
-                f"for {len(X_train)} training samples"
-            )
-
-            # Adaptive grid search based on dataset size
-            rf_grid = GridSearchCV(
-                rf_base, param_grid=selected_params, cv=3, scoring="f1", n_jobs=-1
-            )
-            rf_grid.fit(X_train_scaled, y_train)
-            models["random_forest"] = rf_grid.best_estimator_
-
-            # === MODEL 2: OPTIMIZED GRADIENT BOOSTING ===
-            gb_base = GradientBoostingClassifier(
-                random_state=42, validation_fraction=0.1, n_iter_no_change=10, tol=1e-4
-            )
-
-            gb_grid = GridSearchCV(
-                gb_base,
-                param_grid={
-                    "n_estimators": [150, 200],
-                    "max_depth": [6, 8, 10],
-                    "learning_rate": [0.05, 0.1, 0.15],
-                    "min_samples_split": [10, 20],
-                    "min_samples_leaf": [5, 10],
-                },
-                cv=3,
-                scoring="f1",
-                n_jobs=-1,
-            )
-            gb_grid.fit(X_train_scaled, y_train)
-            models["gradient_boosting"] = gb_grid.best_estimator_
-
-            # === MODEL 3: EXTRA TREES (EXTREMELY RANDOMIZED TREES) ===
-            et = ExtraTreesClassifier(
-                n_estimators=150,
-                max_depth=12,
-                min_samples_split=8,
-                min_samples_leaf=4,
-                max_features="sqrt",
-                random_state=42,
-                n_jobs=-1,
-                class_weight="balanced",
-            )
-            et.fit(X_train_scaled, y_train)
-            models["extra_trees"] = et
-
-            # === MODEL 4: ADAPTIVE BOOSTING ===
-            ada = AdaBoostClassifier(
-                n_estimators=80, learning_rate=0.8, random_state=42
-            )
-            ada.fit(X_train_scaled, y_train)
-            models["ada_boost"] = ada
-
-            # === MODEL 5: SUPPORT VECTOR MACHINE (for small datasets) ===
-            if (
-                len(X_train) < 2000
-            ):  # Only for smaller datasets due to computational cost
-                svm = SVC(
-                    kernel="rbf",
-                    C=1.0,
-                    gamma="scale",
-                    probability=True,
-                    random_state=42,
-                    class_weight="balanced",
-                )
-                svm.fit(X_train_scaled, y_train)
-                models["svm"] = svm
-
-            # === MODEL 6: LOGISTIC REGRESSION (baseline) ===
-            lr = LogisticRegression(
-                C=1.0,
-                penalty="l2",
-                solver="liblinear",
-                random_state=42,
-                class_weight="balanced",
-                max_iter=1000,
-            )
-            lr.fit(X_train_scaled, y_train)
-            models["logistic_regression"] = lr
-
-            # === EVALUATE ALL MODELS ===
-            for name, model in models.items():
-                y_pred = model.predict(X_test_scaled)
-                y_pred_proba = (
-                    model.predict_proba(X_test_scaled)[:, 1]
-                    if hasattr(model, "predict_proba")
-                    else y_pred
-                )
-
-                accuracy = accuracy_score(y_test, y_pred)
-                precision = precision_score(y_test, y_pred, zero_division=0)
-                recall = recall_score(y_test, y_pred, zero_division=0)
-                f1 = f1_score(y_test, y_pred, zero_division=0)
-
-                # Calculate AUC metrics using probabilities when available
+            candidates = self._make_models(fast, len(X_train))
+            fitted: dict = {}
+            results: dict = {}
+            for name, model in candidates.items():
                 try:
-                    from sklearn.metrics import roc_auc_score, average_precision_score
-
-                    if hasattr(model, "predict_proba") and len(np.unique(y_test)) > 1:
-                        auc_roc = roc_auc_score(y_test, y_pred_proba)
-                        auc_pr = average_precision_score(y_test, y_pred_proba)
+                    model.fit(X_train_s, y_train)
+                    if isinstance(model, RandomizedSearchCV):
+                        cv_score = float(model.best_score_)
+                        model = model.best_estimator_
                     else:
-                        # Fallback for models without predict_proba
-                        auc_roc = (
-                            roc_auc_score(y_test, y_pred)
-                            if len(np.unique(y_test)) > 1
-                            else 0.5
-                        )
-                        auc_pr = (
-                            average_precision_score(y_test, y_pred)
-                            if len(np.unique(y_test)) > 1
-                            else 0.5
-                        )
-                except ImportError:
-                    auc_roc = 0.5
-                    auc_pr = 0.5
+                        cv_score = float("nan")
+                    proba = model.predict_proba(X_test_s)[:, 1]
+                    pred = (proba >= 0.5).astype(int)
+                    two_classes = y_test.nunique() > 1
+                    auc = roc_auc_score(y_test, proba) if two_classes else 0.5
+                    results[name] = {
+                        "accuracy": accuracy_score(y_test, pred),
+                        "precision": precision_score(y_test, pred, zero_division=0),
+                        "recall": recall_score(y_test, pred, zero_division=0),
+                        "f1_score": f1_score(y_test, pred, zero_division=0),
+                        "auc_roc": auc,
+                        "auc_pr": average_precision_score(y_test, proba) if two_classes else 0.0,
+                        "cv_score": cv_score,
+                        "feature_importance": self._get_feature_importance(model, feats),
+                    }
+                    fitted[name] = model
+                    logger.info(
+                        f"[ML] {key} {name}: AUC={auc:.3f} AP={results[name]['auc_pr']:.3f} "
+                        f"F1={results[name]['f1_score']:.3f} CV(AP)={cv_score:.3f}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[ML] {key} {name} failed: {e}")
+            if not fitted:
+                return {"status": "all_models_failed"}
 
-                # Cross-validation score
-                cv_scores = cross_val_score(
-                    model, X_train_scaled, y_train, cv=3, scoring="f1"
-                )
-                cv_mean = cv_scores.mean()
-                cv_std = cv_scores.std()
-
-                results[name] = {
-                    "model": model,
-                    "accuracy": accuracy,
-                    "precision": precision,
-                    "recall": recall,
-                    "f1_score": f1,
-                    "auc_roc": auc_roc,
-                    "auc_pr": auc_pr,
-                    "cv_mean": cv_mean,
-                    "cv_std": cv_std,
-                    "probabilities": y_pred_proba,  # Store probabilities for ensemble
-                    "feature_importance": self._get_feature_importance(
-                        model, feature_columns
-                    ),
-                }
-
-                logger.info(
-                    f"{pair} {name}: Acc={accuracy:.3f}, F1={f1:.3f}, "
-                    f"AUC={auc_roc:.3f}, CV={cv_mean:.3f}±{cv_std:.3f}"
+            # Ensemble = top 3 models by out-of-sample AUC, weighted by their skill over random
+            ranked = sorted(results, key=lambda n: results[n]["auc_roc"], reverse=True)[:3]
+            weights = {n: max(results[n]["auc_roc"] - 0.5, 0.01) for n in ranked}
+            best_auc = results[ranked[0]]["auc_roc"]
+            # Shrink predictions toward 0.5 when even the best model is barely better
+            # than a coin flip, so a useless model cannot trigger entries.
+            skill = float(np.clip((best_auc - 0.5) / 0.1, 0.0, 1.0))
+            if skill < 0.2:
+                logger.warning(
+                    f"[ML] {key}: best out-of-sample AUC {best_auc:.3f} ~ random; "
+                    f"predictions will stay close to 0.5"
                 )
 
-            # === CREATE VOTING ENSEMBLE ===
-            # Select top 3 models based on F1 score
-            sorted_models = sorted(
-                results.items(), key=lambda x: x[1]["f1_score"], reverse=True
-            )
-            top_models = [
-                (name, results[name]["model"]) for name, _ in sorted_models[:3]
-            ]
+            members = {n: fitted[n] for n in ranked}
+            if self.refit_on_full_window:
+                # Refit chosen models (with tuned params) on train+test so the newest
+                # candles are used. Metrics above remain out-of-sample.
+                scaler = RobustScaler()
+                X_all_s = scaler.fit_transform(X[feats])
+                refit = {}
+                for n, m in members.items():
+                    try:
+                        refit[n] = clone(m).fit(X_all_s, y)
+                    except Exception as e:
+                        logger.warning(f"[ML] {key} refit {n} failed, keeping train fit: {e}")
+                        refit[n] = m
+                members = refit
 
-            if len(top_models) >= 2:
-                voting_classifier = VotingClassifier(
-                    estimators=top_models, voting="soft"  # Use probability averaging
-                )
-                voting_classifier.fit(X_train_scaled, y_train)
-                models["voting_ensemble"] = voting_classifier
+            self.models[key] = members
+            self.model_weights[key] = weights
+            self.scalers[key] = scaler
+            self.feature_columns[key] = feats
+            self.metrics[key] = results
+            self.skill_factor[key] = skill
+            self.is_trained[key] = True
+            self.last_train_time[key] = _utcnow()
+            self._load_attempted.add(key)
 
-                # Evaluate ensemble
-                y_pred_ensemble = voting_classifier.predict(X_test_scaled)
-                ensemble_f1 = f1_score(y_test, y_pred_ensemble, zero_division=0)
-                ensemble_accuracy = accuracy_score(y_test, y_pred_ensemble)
-
-                results["voting_ensemble"] = {
-                    "model": voting_classifier,
-                    "accuracy": ensemble_accuracy,
-                    "f1_score": ensemble_f1,
-                    "feature_importance": {},  # Ensemble doesn't have direct feature importance
-                }
-
-                logger.info(
-                    f"{pair} Voting Ensemble: Acc={ensemble_accuracy:.3f}, F1={ensemble_f1:.3f}"
-                )
-
-            self.models[pair] = models
-            self.scalers[pair] = scaler
-            self.feature_importance[pair] = results
-            self.is_trained[pair] = True
-            # Update retrain metadata and cache
-            self.last_train_time[pair] = datetime.utcnow()
-            self.last_train_index[pair] = len(df)
-            self.training_cache[pair] = base_df.copy()
-
-            # Save models to disk for persistence
-            self._save_models_to_disk(pair)
-
-            # Find best model
-            best_model_name = max(results.keys(), key=lambda k: results[k]["f1_score"])
-            best_f1 = results[best_model_name]["f1_score"]
+            if persist:
+                self._save_bundle(pair, direction)
 
             return {
                 "status": "success",
-                "results": results,
-                "feature_columns": feature_columns,
+                "best_model": ranked[0],
+                "best_auc": best_auc,
+                "skill": skill,
                 "n_samples": len(X),
-                "best_model": best_model_name,
-                "best_f1_score": best_f1,
-                "n_models": len(models),
+                "n_features": len(feats),
+                "n_models": len(members),
             }
-
         except Exception as e:
-            logger.warning(f"Model training failed for {pair}: {e}")
+            logger.warning(f"[ML] Model training failed for {key}: {e}")
             return {"status": "error", "message": str(e)}
 
     def _get_feature_importance(self, model, feature_columns):
-        """Extract feature importance from different model types"""
         try:
             if hasattr(model, "feature_importances_"):
-                return dict(
-                    zip(feature_columns, model.feature_importances_, strict=True)
-                )
-            elif hasattr(model, "coef_"):
-                # For linear models like LogisticRegression
-                importance = abs(model.coef_[0])
-                return dict(zip(feature_columns, importance, strict=True))
-            else:
-                return {}
+                return dict(zip(feature_columns, model.feature_importances_))
+            if hasattr(model, "coef_"):
+                return dict(zip(feature_columns, np.abs(model.coef_[0])))
         except Exception:
-            return {}
+            pass
+        return {}
 
-    def predict_entry_probability(self, df: pd.DataFrame, pair: str) -> pd.Series:
-        """Predict probability of profitable entry using advanced ensemble models"""
-        if (
-            not SKLEARN_AVAILABLE
-            or pair not in self.is_trained
-            or not self.is_trained[pair]
-        ):
-            return pd.Series(0.5, index=df.index)
-
+    # ----------------- PREDICTION -----------------
+    def predict(
+        self, feature_df: pd.DataFrame, pair: str, direction: str = "long", key_suffix: str = ""
+    ) -> tuple[pd.Series, pd.Series]:
+        """Return (probability, model_disagreement) Series. Neutral 0.5 if no model."""
+        key = self._key(pair, direction) + key_suffix
+        neutral = pd.Series(0.5, index=feature_df.index)
+        no_disagreement = pd.Series(0.0, index=feature_df.index)
+        if not key_suffix:
+            self._ensure_loaded(pair, direction)
+        if not SKLEARN_AVAILABLE or not self.is_trained.get(key, False):
+            return neutral, no_disagreement
         try:
-            feature_df = self.extract_advanced_features(df)
+            cols = self.feature_columns[key]
+            missing = [c for c in cols if c not in feature_df.columns]
+            if missing:
+                logger.warning(f"[ML] {key}: {len(missing)} trained features missing {missing[:5]}; forcing retrain")
+                self.is_trained[key] = False
+                return neutral, no_disagreement
 
-            # Get feature columns used in training
-            if (
-                pair in self.feature_importance
-                and "random_forest" in self.feature_importance[pair]
-            ):
-                feature_columns = list(
-                    self.feature_importance[pair]["random_forest"][
-                        "feature_importance"
-                    ].keys()
-                )
-            else:
-                # Fallback: use all available numeric columns
-                exclude_cols = [
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "date",
-                    "enter_long",
-                    "enter_short",
-                    "exit_long",
-                    "exit_short",
-                ]
-                feature_columns = [
-                    col
-                    for col in feature_df.columns
-                    if col not in exclude_cols
-                    and feature_df[col].dtype in ["float64", "int64"]
-                ]
+            X = feature_df[cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+            X_s = self.scalers[key].transform(X)
 
-            X = feature_df[feature_columns].fillna(0)
-            X_scaled = self.scalers[pair].transform(X)
-
-            # Get predictions from all available models
-            model_predictions = {}
-            model_weights = {}
-
-            for model_name, model in self.models[pair].items():
+            preds: dict[str, np.ndarray] = {}
+            for name, model in self.models[key].items():
                 try:
-                    if hasattr(model, "predict_proba"):
-                        prob = model.predict_proba(X_scaled)[:, 1]
-                    else:
-                        # For models without probability prediction
-                        pred = model.predict(X_scaled)
-                        prob = (
-                            pred + 1
-                        ) / 2  # Convert -1,1 to 0,1 or similar normalization
-
-                    model_predictions[model_name] = prob
-
-                    # Weight based on model performance (F1 score or accuracy)
-                    if (
-                        pair in self.feature_importance
-                        and model_name in self.feature_importance[pair]
-                    ):
-                        performance_metrics = self.feature_importance[pair][model_name]
-                        # Use F1 score if available, otherwise accuracy
-                        weight = performance_metrics.get(
-                            "f1_score", performance_metrics.get("accuracy", 0.5)
-                        )
-                    else:
-                        weight = 0.5
-
-                    model_weights[model_name] = max(
-                        weight, 0.1
-                    )  # Minimum weight of 0.1
-
+                    preds[name] = model.predict_proba(X_s)[:, 1]
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to get predictions from {model_name} for {pair}: {e}"
-                    )
-                    continue
+                    logger.warning(f"[ML] {key} {name} predict failed: {e}")
+            if not preds:
+                return neutral, no_disagreement
 
-            if not model_predictions:
-                return pd.Series(0.5, index=df.index)
+            weights = self.model_weights.get(key, {})
+            total = sum(weights.get(n, 0.01) for n in preds)
+            final = sum(preds[n] * weights.get(n, 0.01) for n in preds) / total
 
-            # === ADVANCED ENSEMBLE PREDICTION ===
+            # Per-row market condition (the old version used the LAST 20 candles for the
+            # whole history, which leaked the future into backtests).
+            close = feature_df["close"]
+            vol = close.pct_change().rolling(20).std().to_numpy()
+            chg = close.pct_change(19).abs().to_numpy()
+            volatile = np.nan_to_num(vol) > 0.03
+            trending = ~volatile & (np.nan_to_num(chg) > 0.05)
+            ranging = ~volatile & ~trending
+            if "gradient_boosting" in preds:
+                final = np.where(trending, 0.5 * final + 0.5 * preds["gradient_boosting"], final)
+            if "random_forest" in preds:
+                final = np.where(volatile, 0.5 * final + 0.5 * preds["random_forest"], final)
+            for name in ("svm", "logistic_regression"):
+                if name in preds:
+                    final = np.where(ranging, 0.6 * final + 0.4 * preds[name], final)
+                    break
 
-            # Method 1: Weighted average by performance
-            total_weight = sum(model_weights.values())
-            if total_weight > 0:
-                weighted_avg = np.zeros(len(X))
-                for model_name, predictions in model_predictions.items():
-                    weight = model_weights[model_name] / total_weight
-                    weighted_avg += predictions * weight
+            # Shrink toward neutral when models disagree
+            if len(preds) > 1:
+                disagreement = np.std(np.vstack(list(preds.values())), axis=0)
+                confidence = 1 - np.clip(disagreement * 2, 0, 0.3)
+                final = final * confidence + 0.5 * (1 - confidence)
             else:
-                weighted_avg = np.mean(list(model_predictions.values()), axis=0)
+                disagreement = np.zeros(len(final))
 
-            # Method 2: Voting ensemble (if available)
-            if "voting_ensemble" in model_predictions:
-                ensemble_pred = model_predictions["voting_ensemble"]
-                # Combine weighted average with voting ensemble
-                final_prediction = 0.6 * ensemble_pred + 0.4 * weighted_avg
-            else:
-                final_prediction = weighted_avg
+            # Shrink toward neutral when the model has little out-of-sample skill
+            skill = self.skill_factor.get(key, 1.0)
+            final = 0.5 + (final - 0.5) * skill
 
-            # Method 3: Dynamic model selection based on market conditions
-            if hasattr(self, "_detect_market_regime"):
-                market_regime = self._detect_market_condition(df)
-
-                # Adjust predictions based on market conditions
-                if market_regime == "trending":
-                    # In trending markets, prefer gradient boosting
-                    if "gradient_boosting" in model_predictions:
-                        final_prediction = (
-                            0.5 * final_prediction
-                            + 0.5 * model_predictions["gradient_boosting"]
-                        )
-                elif market_regime == "volatile":
-                    # In volatile markets, prefer random forest
-                    if "random_forest" in model_predictions:
-                        final_prediction = (
-                            0.5 * final_prediction
-                            + 0.5 * model_predictions["random_forest"]
-                        )
-                elif market_regime == "ranging":
-                    # In ranging markets, prefer SVM or logistic regression
-                    if "svm" in model_predictions:
-                        final_prediction = (
-                            0.6 * final_prediction + 0.4 * model_predictions["svm"]
-                        )
-                    elif "logistic_regression" in model_predictions:
-                        final_prediction = (
-                            0.6 * final_prediction
-                            + 0.4 * model_predictions["logistic_regression"]
-                        )
-
-            # === CONFIDENCE ADJUSTMENT ===
-
-            # Calculate prediction confidence based on model agreement
-            if len(model_predictions) > 1:
-                predictions_array = np.array(list(model_predictions.values()))
-                prediction_std = np.std(predictions_array, axis=0)
-
-                # Higher standard deviation = lower confidence
-                confidence_factor = 1 - np.clip(prediction_std * 2, 0, 0.3)
-
-                # Adjust predictions toward neutral when confidence is low
-                final_prediction = final_prediction * confidence_factor + 0.5 * (
-                    1 - confidence_factor
-                )
-
-            # === OUTLIER DETECTION AND SMOOTHING ===
-
-            # Apply rolling smoothing to reduce noise
-            result_series = pd.Series(final_prediction, index=df.index)
-            smoothed_result = result_series.rolling(window=3, center=True).mean()
-            smoothed_result = smoothed_result.fillna(result_series)
-
-            # Ensure values are in valid range [0, 1]
-            smoothed_result = smoothed_result.clip(0, 1)
-
-            return smoothed_result
-
+            # Causal smoothing (the old rolling(center=True) looked one candle ahead)
+            result = pd.Series(final, index=feature_df.index).ewm(span=3, adjust=False).mean()
+            return result.clip(0, 1), pd.Series(disagreement, index=feature_df.index)
         except Exception as e:
-            logger.warning(f"Advanced prediction failed for {pair}: {e}")
-            return pd.Series(0.5, index=df.index)
+            logger.warning(f"[ML] Prediction failed for {key}: {e}")
+            return neutral, no_disagreement
 
-    def _detect_market_condition(self, df: pd.DataFrame) -> str:
-        """Detect current market condition for dynamic model selection"""
-        try:
-            # Simple market regime detection
-            recent_data = df.tail(20)
+    def walk_forward_predict(
+        self, feature_df: pd.DataFrame, df: pd.DataFrame, pair: str, direction: str = "long"
+    ) -> tuple[pd.Series, pd.Series, pd.Series]:
+        """Backtest-safe prediction: every block of candles is predicted by a model
+        trained only on candles before it. Returns (prob, disagreement, ready_flag)."""
+        n = len(df)
+        prob = pd.Series(0.5, index=df.index)
+        disagreement = pd.Series(0.0, index=df.index)
+        ready = pd.Series(0, index=df.index)
 
-            if len(recent_data) < 10:
-                return "unknown"
+        first_date = df["date"].iloc[0] if "date" in df.columns else 0
+        last_date = df["date"].iloc[-1] if "date" in df.columns else n
+        cache_key = (pair, direction, n, str(first_date), str(last_date))
+        if cache_key in self._wf_cache:
+            p, d, r = self._wf_cache[cache_key]
+            return p.copy(), d.copy(), r.copy()
 
-            # Calculate volatility
-            returns = recent_data["close"].pct_change().dropna()
-            volatility = returns.std()
+        window = self.initial_train_candles
+        step = max(50, self.backtest_retrain_step)
+        start = window if n > window + step // 2 else max(self.min_train_rows + 50, n // 2)
+        if start >= n:
+            return prob, disagreement, ready
 
-            # Calculate trend strength
-            price_change = (
-                recent_data["close"].iloc[-1] - recent_data["close"].iloc[0]
-            ) / recent_data["close"].iloc[0]
+        suffix = "|walkforward"
+        for s in range(start, n, step):
+            lo = max(0, s - window)
+            res = self.train(
+                feature_df.iloc[lo:s], df.iloc[lo:s], pair, direction,
+                fast=True, persist=False, key_suffix=suffix,
+            )
+            if res.get("status") != "success":
+                continue
+            e = min(s + step, n)
+            ctx = max(0, s - 10)  # small context so the EWM smoothing is warmed up
+            p, d = self.predict(feature_df.iloc[ctx:e], pair, direction, key_suffix=suffix)
+            prob.iloc[s:e] = p.iloc[s - ctx :].to_numpy()
+            disagreement.iloc[s:e] = d.iloc[s - ctx :].to_numpy()
+            ready.iloc[s:e] = 1
+        self._wf_cache[cache_key] = (prob.copy(), disagreement.copy(), ready.copy())
+        return prob, disagreement, ready
 
-            if volatility > 0.03:  # High volatility threshold
-                return "volatile"
-            elif abs(price_change) > 0.05:  # Strong trend threshold
-                return "trending"
-            else:
-                return "ranging"
 
-        except Exception:
-            return "unknown"
-
-
-# Initialize the predictive engine globally
+# Global engine instance (models dir is re-pointed to user_data_dir in bot_start)
 predictive_engine = AdvancedPredictiveEngine()
+
+# Weight of the ML probability in ml_enhanced_score (rest = ultimate_score).
+# The old code used the rolling std of the ML probability as the weight, which
+# meant the ML signal contributed ~2-10% and less the more stable it was.
+ML_SCORE_WEIGHT = 0.5
 
 
 def calculate_advanced_predictive_signals(
-    dataframe: pd.DataFrame, pair: str
+    dataframe: pd.DataFrame,
+    pair: str,
+    backtest_mode: bool = False,
+    train_short_model: bool = True,
 ) -> pd.DataFrame:
-    """Main function to calculate advanced predictive signals with enhanced models.
+    """Add ML columns to the dataframe.
 
-    Training logic:
-    1. If assets missing -> train immediately
-    2. If assets exist but 48h+ passed since strategy start -> retrain
-    3. Otherwise skip training
+    Live / dry-run: train when no model exists or the model is older than
+    retrain_interval_hours (checked per pair, so it no longer retrains on every
+    candle once the bot has been up for 48h), then predict.
+
+    Backtest / hyperopt: walk-forward training so no candle is ever predicted by a
+    model that has seen it (or its future). Models from disk are NOT used, because
+    they were trained on data that lies inside the backtest period.
     """
+    engine = predictive_engine
+    directions = ["long"] + (["short"] if train_short_model else [])
     try:
-        need_training = False
-        assets_exist = False
-        try:
-            assets_exist = predictive_engine._assets_exist(pair)
-        except Exception:
-            assets_exist = False
+        feature_df = engine.extract_advanced_features(dataframe)
+        outputs: dict[str, tuple[pd.Series, pd.Series, pd.Series]] = {}
 
-        # Check time since strategy startup
-        now_utc = datetime.utcnow()
-        hours_since_startup = (
-            now_utc - predictive_engine.strategy_start_time
-        ).total_seconds() / 3600.0
+        for direction in directions:
+            if backtest_mode:
+                outputs[direction] = engine.walk_forward_predict(feature_df, dataframe, pair, direction)
+                continue
 
-        if not assets_exist:
-            # Missing assets -> train immediately
-            if len(dataframe) >= 200:
-                need_training = True
-        elif (
-            predictive_engine.enable_startup_retrain
-            and hours_since_startup >= predictive_engine.retrain_after_startup_hours
-        ):
-            # Assets exist but 48h+ passed since startup -> retrain
-            if len(dataframe) >= 200:
-                need_training = True
-                logger.info(
-                    f"[ML] Triggering 48h startup retrain for {pair} "
-                    f"(startup+{hours_since_startup:.1f}h)"
+            if engine.needs_training(pair, direction) and len(dataframe) >= engine.min_train_rows + 100:
+                window = engine.initial_train_candles
+                logger.info(f"[ML] Training {direction} models for {pair} (len={len(dataframe)})")
+                res = engine.train(
+                    feature_df.iloc[-window:], dataframe.iloc[-window:], pair, direction,
+                    fast=engine.live_fast_mode, persist=True,
                 )
+                if res.get("status") == "success":
+                    logger.info(
+                        f"🚀 {pair} {direction} ML trained: {res['n_models']} models, "
+                        f"best {res['best_model']} AUC={res['best_auc']:.3f} skill={res['skill']:.2f}"
+                    )
+                else:
+                    logger.warning(f"❌ {pair} {direction} ML training status: {res}")
+            p, d = engine.predict(feature_df, pair, direction)
+            ready = pd.Series(int(engine.is_trained.get(engine._key(pair, direction), False)), index=dataframe.index)
+            outputs[direction] = (p, d, ready)
 
-        if need_training:
-            logger.info(
-                f"[ML] Training models for {pair} (len={len(dataframe)}) | assets_exist={assets_exist}"
-            )
-            training_result = predictive_engine.train_predictive_models(dataframe, pair)
-            status = training_result.get("status")
-            if status == "success":
-                best_model = training_result.get("best_model", "unknown")
-                best_f1 = training_result.get("best_f1_score", 0)
-                n_models = training_result.get("n_models", 0)
-                logger.info(
-                    f"🚀 {pair} ML Training Success: {n_models} models (Best {best_model} F1={best_f1:.3f})"
-                )
-            elif status == "skipped_assets_exist":
-                logger.info(f"[ML] Skip training (assets present) {pair}")
-            else:
-                logger.warning(f"❌ ML training status {pair}: {status}")
+        long_prob, long_dis, long_ready = outputs["long"]
+        dataframe["ml_entry_probability"] = long_prob
+        dataframe["ml_model_ready"] = long_ready
+        dataframe["ml_model_agreement"] = (1 - 2 * long_dis).clip(0, 1)
 
-        # Enhanced ML probability prediction
-        dataframe["ml_entry_probability"] = predictive_engine.predict_entry_probability(
-            dataframe, pair
-        )
-
-        # Get momentum and volatility regime safely
-        momentum_regime = dataframe.get("momentum_regime")
-        volatility_regime = dataframe.get("volatility_regime")
-        quantum_coherence = dataframe.get("quantum_momentum_coherence")
-        neural_pattern = dataframe.get("neural_pattern_score")
-
-        # Advanced confidence scoring with safe comparisons
-        ml_high_conf_conditions = dataframe["ml_entry_probability"] > 0.8
-
-        if momentum_regime is not None:
-            ml_high_conf_conditions &= momentum_regime > 0
-
-        if volatility_regime is not None:
-            ml_high_conf_conditions &= volatility_regime < 2
-
-        dataframe["ml_high_confidence"] = ml_high_conf_conditions.astype(int)
-
-        # Ultra-high confidence entries with safe checks
-        ml_ultra_conf_conditions = dataframe["ml_entry_probability"] > 0.9
-
-        if quantum_coherence is not None:
-            ml_ultra_conf_conditions &= quantum_coherence > 0.7
+        if "short" in outputs and outputs["short"][2].any():
+            short_prob, _, short_ready = outputs["short"]
+            # Fall back to the mirrored long model where no short model was available
+            dataframe["ml_short_probability"] = short_prob.where(short_ready == 1, 1 - long_prob)
         else:
-            # Use fallback threshold if quantum analysis not available
-            ml_ultra_conf_conditions &= dataframe["ml_entry_probability"] > 0.92
+            dataframe["ml_short_probability"] = 1 - long_prob
 
-        if neural_pattern is not None:
-            ml_ultra_conf_conditions &= neural_pattern > 0.8
-        else:
-            # Use fallback threshold if neural analysis not available
-            ml_ultra_conf_conditions &= dataframe["ml_entry_probability"] > 0.93
+        # Confidence flags (regimes come from the feature frame; the old code looked
+        # them up on the strategy dataframe where they never existed)
+        momentum_regime = feature_df["momentum_regime"]
+        volatility_regime = feature_df["volatility_regime"]
+        dataframe["ml_high_confidence"] = (
+            (long_prob > 0.8) & (momentum_regime > 0) & (volatility_regime < 2)
+        ).astype(int)
+        dataframe["ml_ultra_confidence"] = (long_prob > 0.93).astype(int)
 
-        dataframe["ml_ultra_confidence"] = ml_ultra_conf_conditions.astype(int)
-
-        # Enhanced score combination
         if "ultimate_score" in dataframe.columns:
-            # Dynamic weighting based on model performance - fix Series comparison
-            ml_volatility = (
-                dataframe["ml_entry_probability"].rolling(20).std().fillna(0.3)
-            )
-            ml_weight = ml_volatility.clip(
-                upper=0.5
-            )  # Safe way to apply min with Series
-            traditional_weight = 1 - ml_weight
-
-            dataframe["ml_enhanced_score"] = (
-                dataframe["ultimate_score"] * traditional_weight
-                + dataframe["ml_entry_probability"] * ml_weight
-            )
+            u = dataframe["ultimate_score"]
+            dataframe["ml_enhanced_score"] = u * (1 - ML_SCORE_WEIGHT) + long_prob * ML_SCORE_WEIGHT
+            dataframe["ml_enhanced_short_score"] = (1 - u) * (1 - ML_SCORE_WEIGHT) + dataframe[
+                "ml_short_probability"
+            ] * ML_SCORE_WEIGHT
         else:
-            dataframe["ml_enhanced_score"] = dataframe["ml_entry_probability"]
-
-        # Model agreement indicator - fix Series std calculation
-        if pair in predictive_engine.models and len(predictive_engine.models[pair]) > 1:
-            # Calculate prediction variance as agreement measure
-            prob_std = dataframe["ml_entry_probability"].rolling(5).std().fillna(0)
-            dataframe["ml_model_agreement"] = (1 - prob_std).clip(lower=0, upper=1)
-        else:
-            dataframe["ml_model_agreement"] = 0.8  # Default agreement
-
+            dataframe["ml_enhanced_score"] = long_prob
+            dataframe["ml_enhanced_short_score"] = dataframe["ml_short_probability"]
         return dataframe
 
     except Exception as e:
-        logger.warning(f"Advanced predictive analysis failed for {pair}: {e}")
+        logger.warning(f"[ML] Advanced predictive analysis failed for {pair}: {e}")
         dataframe["ml_entry_probability"] = 0.5
+        dataframe["ml_short_probability"] = 0.5
+        dataframe["ml_model_ready"] = 0
         dataframe["ml_enhanced_score"] = dataframe.get("ultimate_score", 0.5)
+        dataframe["ml_enhanced_short_score"] = 1 - dataframe.get("ultimate_score", 0.5)
         dataframe["ml_high_confidence"] = 0
         dataframe["ml_ultra_confidence"] = 0
         dataframe["ml_model_agreement"] = 0.5
@@ -2029,27 +1564,16 @@ def calculate_neural_pattern_recognition(dataframe: pd.DataFrame) -> pd.DataFram
             "close"
         ]
 
-        pattern_memory = []
-        for i in range(len(dataframe)):
-            if i < 5:
-                pattern_memory.append(0)
-                continue
-
-            recent_patterns = dataframe[
-                ["body_size", "upper_shadow", "lower_shadow"]
-            ].iloc[i - 4 : i + 1]
-            pattern_signature = recent_patterns.values.flatten()
-            pattern_norm = np.linalg.norm(pattern_signature)
-
-            if pattern_norm > 0:
-                pattern_score = min(1.0, pattern_norm / 0.1)
-            else:
-                pattern_score = 0
-
-            pattern_memory.append(pattern_score)
-
-        dataframe["neural_pattern_score"] = pd.Series(
-            pattern_memory, index=dataframe.index
+        # L2 norm of the last 5 candles' shape vector (vectorised version of the
+        # former Python loop; identical result, ~100x faster)
+        sq = (
+            dataframe["body_size"] ** 2
+            + dataframe["upper_shadow"] ** 2
+            + dataframe["lower_shadow"] ** 2
+        )
+        pattern_norm = np.sqrt(sq.rolling(5).sum())
+        dataframe["neural_pattern_score"] = (
+            (pattern_norm / 0.1).clip(upper=1.0).fillna(0)
         )
         dataframe["pattern_prediction_confidence"] = (
             dataframe["neural_pattern_score"].rolling(10).std()
@@ -2186,22 +1710,23 @@ def calculate_dynamic_profit_targets(
 
 
 def calculate_advanced_stop_loss(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Stop distance in price units, and final_stop_loss as a negative ratio.
+
+    The old version clipped a *price distance* (always positive) to [-0.15, -0.01],
+    so final_stop_loss was always -0.01 regardless of volatility.
+    """
     dataframe["base_stop_loss"] = dataframe["atr"] * 1.5
+    stop_distance = dataframe["base_stop_loss"]
     if "minima_sort_threshold" in dataframe.columns:
         dataframe["support_stop_loss"] = (
             dataframe["close"] - dataframe["minima_sort_threshold"]
-        )
-        dataframe["support_stop_loss"] = dataframe["support_stop_loss"].clip(
-            dataframe["base_stop_loss"] * 0.5,
-            dataframe["base_stop_loss"] * 1.5,  # Reduced from 2.0
-        )
-        dataframe["final_stop_loss"] = np.minimum(
+        ).clip(dataframe["base_stop_loss"] * 0.5, dataframe["base_stop_loss"] * 1.5)
+        stop_distance = np.minimum(
             dataframe["base_stop_loss"], dataframe["support_stop_loss"]
-        ).clip(
-            -0.15, -0.01
-        )  # Hard cap at -15%
-    else:
-        dataframe["final_stop_loss"] = dataframe["base_stop_loss"].clip(-0.15, -0.01)
+        )
+    dataframe["final_stop_loss"] = -(stop_distance / dataframe["close"]).clip(
+        0.01, 0.15
+    )
     return dataframe
 
 
@@ -2527,18 +2052,40 @@ class AlexNexusForgeV8AIV2(IStrategy):
     ignore_roi_if_entry_signal = (
         False  # CHANGED: Allow ROI to work even with entry signals
     )
-    process_only_new_candles = False
+    # True: indicators + ML only recompute when a new candle closes. False re-ran the
+    # whole (very heavy) pipeline on every bot loop, i.e. every few seconds per pair.
+    process_only_new_candles = True
     use_custom_exits_advanced = True
     use_emergency_exits = True
 
+    # Position adjustment (DCA). max_entry_position_adjustment is the hard cap
+    # (= top of the max_safety_orders range); the parameter decides the actual count.
+    position_adjustment_enable = True
+    max_entry_position_adjustment = 3
+
+    # =====================================================================
+    # HYPEROPT PARAMETERS
+    # ---------------------------------------------------------------------
+    # Freqtrade's hyperopt runs populate_indicators ONCE per pair and only
+    # re-runs populate_entry_trend / populate_exit_trend and the callbacks
+    # (custom_stoploss, custom_exit, leverage, adjust_trade_position, ...) for
+    # each epoch. So a parameter can only be optimised if it is read outside
+    # populate_indicators, or if every candidate value is precomputed there.
+    #   optimize=True  -> genuinely changes results between epochs
+    #   optimize=False -> feeds populate_indicators / the ML features; tune it
+    #                     with separate backtests instead (load=True keeps it
+    #                     loadable from a params JSON file).
+    # ~50 parameters that were defined but never read anywhere were removed;
+    # hyperopt was searching those dimensions for nothing.
+    # =====================================================================
+
+    # --- Regime protection (evaluated per epoch in populate_entry_trend + custom_exit)
     regime_change_enabled = BooleanParameter(
         default=True, space="sell", optimize=True, load=True
     )
     regime_change_sensitivity = DecimalParameter(
         0.3, 0.8, default=0.5, decimals=2, space="sell", optimize=True, load=True
     )
-
-    # Flash Move Detection
     flash_move_enabled = BooleanParameter(
         default=True, space="sell", optimize=True, load=True
     )
@@ -2548,16 +2095,18 @@ class AlexNexusForgeV8AIV2(IStrategy):
     flash_move_candles = IntParameter(
         3, 10, default=5, space="sell", optimize=True, load=True
     )
-
-    # Volume Spike Detection
     volume_spike_enabled = BooleanParameter(
         default=True, space="sell", optimize=True, load=True
     )
     volume_spike_multiplier = DecimalParameter(
         2.0, 5.0, default=3.0, decimals=1, space="sell", optimize=True, load=True
     )
-
-    # Emergency Exit Protection
+    sentiment_protection_enabled = BooleanParameter(
+        default=True, space="sell", optimize=True, load=True
+    )
+    sentiment_shift_threshold = DecimalParameter(
+        0.2, 0.4, default=0.3, decimals=2, space="sell", optimize=True, load=True
+    )
     emergency_exit_enabled = BooleanParameter(
         default=True, space="sell", optimize=True, load=True
     )
@@ -2565,121 +2114,50 @@ class AlexNexusForgeV8AIV2(IStrategy):
         0.005, 0.03, default=0.015, decimals=3, space="sell", optimize=True, load=True
     )
 
-    # Trailing Stop Exit Control (NEW: Fix for "Blocking trailing stop exit")
-    trailing_exit_min_profit = DecimalParameter(
-        -0.03, 0.02, default=-0.002, decimals=3, space="sell", optimize=True, load=True
-    )
+    # --- Trailing-stop exit control. Safety switch, deliberately not optimised:
+    # letting hyperopt "discover" that blocking stop exits looks good in a
+    # backtest is exactly how accounts get liquidated.
     allow_trailing_exit_when_negative = BooleanParameter(
         default=True, space="sell", optimize=False, load=True
     )
-
-    # Market Sentiment Protection
-    sentiment_protection_enabled = BooleanParameter(
-        default=True, space="sell", optimize=True, load=True
-    )
-    sentiment_shift_threshold = DecimalParameter(
-        0.2, 0.4, default=0.3, decimals=2, space="sell", optimize=True, load=True
+    trailing_exit_min_profit = DecimalParameter(
+        -0.03, 0.02, default=-0.002, decimals=3, space="sell", optimize=False, load=True
     )
 
-    # 🔧ATR STOPLOSS PARAMETERS (Anpassbar machen)
+    # --- ATR stoploss (custom_stoploss). The widest stop is capped by the static
+    # `stoploss` (-0.11), so atr_stoploss_maximum (-0.15..-0.30) only matters if
+    # you loosen `stoploss`; it is therefore not optimised.
     atr_stoploss_multiplier = DecimalParameter(
         0.8, 2.0, default=1.0, decimals=1, space="sell", optimize=True, load=True
     )
-    atr_stoploss_minimum = DecimalParameter(
-        -0.25, -0.10, default=-0.12, decimals=2, space="sell", optimize=True, load=True
-    )
     atr_stoploss_maximum = DecimalParameter(
-        -0.30, -0.15, default=-0.18, decimals=2, space="sell", optimize=True, load=True
+        -0.30, -0.15, default=-0.18, decimals=2, space="sell", optimize=False, load=True
     )
     atr_stoploss_ceiling = DecimalParameter(
         -0.10, -0.06, default=-0.06, decimals=2, space="sell", optimize=True, load=True
     )
-    # DCA parameters
+
+    # --- DCA / safety orders (adjust_trade_position + custom_stake_amount)
+    dca_enabled = BooleanParameter(default=True, space="buy", optimize=True, load=True)
+    # Loss from the FIRST entry (leveraged profit ratio, like current_profit) that
+    # triggers safety order 1. Later orders are spaced by safety_order_step_scale.
     initial_safety_order_trigger = DecimalParameter(
-        low=-0.02,
-        high=-0.01,
-        default=-0.018,
-        decimals=3,
-        space="buy",
-        optimize=True,
-        load=True,
+        low=-0.02, high=-0.01, default=-0.018, decimals=3,
+        space="buy", optimize=True, load=True,
     )
-    max_safety_orders = IntParameter(
-        1, 3, default=1, space="buy", optimize=True, load=True
-    )
+    max_safety_orders = IntParameter(1, 3, default=1, space="buy", optimize=True, load=True)
     safety_order_step_scale = DecimalParameter(
-        low=1.05,
-        high=1.5,
-        default=1.25,
-        decimals=2,
-        space="buy",
-        optimize=True,
-        load=True,
+        low=1.05, high=1.5, default=1.25, decimals=2, space="buy", optimize=True, load=True,
     )
     safety_order_volume_scale = DecimalParameter(
-        low=1.1,
-        high=2.0,
-        default=1.4,
-        decimals=1,
-        space="buy",
-        optimize=True,
-        load=True,
+        low=1.1, high=2.0, default=1.4, decimals=1, space="buy", optimize=True, load=True,
     )
-    h2 = IntParameter(20, 60, default=40, space="buy", optimize=True, load=True)
-    h1 = IntParameter(10, 40, default=20, space="buy", optimize=True, load=True)
-    h0 = IntParameter(5, 20, default=10, space="buy", optimize=True, load=True)
-    cp = IntParameter(5, 20, default=10, space="buy", optimize=True, load=True)
-
-    # Entry parameters
-    increment_for_unique_price = DecimalParameter(
-        low=1.0005,
-        high=1.002,
-        default=1.001,
-        decimals=4,
-        space="buy",
-        optimize=True,
-        load=True,
-    )
-    last_entry_price: Optional[float] = None
-
-    # Protection parameters
-    cooldown_lookback = IntParameter(
-        2, 48, default=1, space="protection", optimize=True
-    )
-    stop_duration = IntParameter(12, 200, default=4, space="protection", optimize=True)
-    use_stop_protection = BooleanParameter(
-        default=True, space="protection", optimize=True
+    # Skip a safety order when the ML model for the trade's side has turned against it
+    dca_ml_guard = DecimalParameter(
+        0.35, 0.55, default=0.45, decimals=2, space="buy", optimize=True, load=True
     )
 
-    # Murrey Math level parameters
-    mml_const1 = DecimalParameter(
-        1.0, 1.1, default=1.0699, decimals=4, space="buy", optimize=True, load=True
-    )
-    mml_const2 = DecimalParameter(
-        0.99, 1.0, default=0.99875, decimals=5, space="buy", optimize=True, load=True
-    )
-    indicator_mml_window = IntParameter(
-        32, 128, default=64, space="buy", optimize=True, load=True
-    )
-
-    # Dynamic Stoploss parameters
-    # Add these parameters
-    stoploss_atr_multiplier = DecimalParameter(
-        1.0, 3.0, default=1.5, space="sell", optimize=True
-    )
-    stoploss_max_reasonable = DecimalParameter(
-        -0.30, -0.15, default=-0.20, space="sell", optimize=True
-    )
-
-    # === Hyperopt Parameters ===
-    dominance_threshold = IntParameter(1, 10, default=3, space="buy", optimize=True)
-    tightness_factor = DecimalParameter(
-        0.5, 2.0, default=1.0, space="buy", optimize=True
-    )
-    long_rsi_threshold = IntParameter(50, 65, default=50, space="buy", optimize=True)
-    short_rsi_threshold = IntParameter(30, 45, default=35, space="sell", optimize=True)
-
-    # Dynamic Leverage parameters
+    # --- Dynamic leverage (leverage callback, evaluated per trade)
     leverage_window_size = IntParameter(
         20, 100, default=70, space="buy", optimize=True, load=True
     )
@@ -2705,160 +2183,45 @@ class AlexNexusForgeV8AIV2(IStrategy):
         0.01, 0.05, default=0.03, decimals=3, space="buy", optimize=True, load=True
     )
 
-    # Indicator parameters
+    # --- Extrema order: every candidate is precomputed in populate_indicators and
+    # the active one is selected in populate_entry_trend, so this IS optimisable.
     indicator_extrema_order = IntParameter(
         3, 15, default=8, space="buy", optimize=True, load=True
-    )  # War 5
+    )
+
+    # --- Indicator-stage parameters (feed populate_indicators and the ML model)
+    h2 = IntParameter(20, 60, default=40, space="buy", optimize=False, load=True)
+    h1 = IntParameter(10, 40, default=20, space="buy", optimize=False, load=True)
+    h0 = IntParameter(5, 20, default=10, space="buy", optimize=False, load=True)
+    cp = IntParameter(5, 20, default=10, space="buy", optimize=False, load=True)
+    mml_const1 = DecimalParameter(
+        1.0, 1.1, default=1.0699, decimals=4, space="buy", optimize=False, load=True
+    )
+    mml_const2 = DecimalParameter(
+        0.99, 1.0, default=0.99875, decimals=5, space="buy", optimize=False, load=True
+    )
     indicator_mml_window = IntParameter(
-        50, 200, default=50, space="buy", optimize=True, load=True
-    )  # War 50
+        50, 200, default=50, space="buy", optimize=False, load=True
+    )
     indicator_rolling_window_threshold = IntParameter(
-        20, 100, default=50, space="buy", optimize=True, load=True
-    )  # War 20
+        20, 100, default=50, space="buy", optimize=False, load=True
+    )
     indicator_rolling_check_window = IntParameter(
-        5, 20, default=10, space="buy", optimize=True, load=True
-    )  # War 5
-
-    # Market breadth parameters
-    market_breadth_enabled = BooleanParameter(default=True, space="buy", optimize=True)
-    market_breadth_threshold = DecimalParameter(
-        0.3, 0.6, default=0.45, space="buy", optimize=True
+        5, 20, default=10, space="buy", optimize=False, load=True
     )
-
-    # Total market cap parameters
-    total_mcap_filter_enabled = BooleanParameter(
-        default=True, space="buy", optimize=True
-    )
-    total_mcap_ma_period = IntParameter(20, 100, default=50, space="buy", optimize=True)
-
-    # Market regime parameters
-    regime_filter_enabled = BooleanParameter(default=True, space="buy", optimize=True)
-    regime_lookback_period = IntParameter(
-        24, 168, default=48, space="buy", optimize=True
-    )  # hours
-
-    # Fear & Greed parameters
-    fear_greed_enabled = BooleanParameter(
-        default=False, space="buy", optimize=True
-    )  # Optional
-    fear_greed_extreme_threshold = IntParameter(
-        20, 30, default=25, space="buy", optimize=True
-    )
-    fear_greed_greed_threshold = IntParameter(
-        70, 80, default=75, space="buy", optimize=True
-    )
-    # Momentum
-    avoid_strong_trends = BooleanParameter(default=True, space="buy", optimize=True)
-    trend_strength_threshold = DecimalParameter(
-        0.01, 0.05, default=0.02, space="buy", optimize=True
-    )
-    momentum_confirmation_candles = IntParameter(
-        1, 5, default=2, space="buy", optimize=True
-    )
-
-    # Dynamic exit based on entry quality
-    dynamic_exit_enabled = BooleanParameter(
-        default=True, space="sell", optimize=False, load=True
-    )
-    exit_on_confluence_loss = BooleanParameter(
-        default=True, space="sell", optimize=False, load=True
-    )
-    exit_on_structure_break = BooleanParameter(
-        default=True, space="sell", optimize=False, load=True
-    )
-
-    # Profit target multipliers based on entry type
-    high_quality_profit_multiplier = DecimalParameter(
-        1.2, 3.0, default=2.0, space="sell", optimize=True, load=True
-    )
-    medium_quality_profit_multiplier = DecimalParameter(
-        1.0, 2.5, default=1.5, space="sell", optimize=True, load=True
-    )
-    backup_profit_multiplier = DecimalParameter(
-        0.8, 2.0, default=1.2, space="sell", optimize=True, load=True
-    )
-
-    # Advanced exit thresholds
-    volume_decline_exit_threshold = DecimalParameter(
-        0.3, 0.8, default=0.5, space="sell", optimize=True, load=True
-    )
-    momentum_decline_exit_threshold = IntParameter(
-        1, 4, default=2, space="sell", optimize=True, load=True
-    )
-    structure_deterioration_threshold = DecimalParameter(
-        -3.0, 0.0, default=-1.5, space="sell", optimize=True, load=True
-    )
-
-    # RSI exit levels
-    rsi_overbought_exit = IntParameter(
-        70, 85, default=75, space="sell", optimize=True, load=True
-    )
-    rsi_divergence_exit_enabled = BooleanParameter(
-        default=True, space="sell", optimize=False, load=True
-    )
-
-    # Trailing stop improvements
-    use_advanced_trailing = BooleanParameter(
-        default=False, space="sell", optimize=False, load=True
-    )
-    trailing_stop_positive_offset_high_quality = DecimalParameter(
-        0.02, 0.08, default=0.04, space="sell", optimize=True, load=True
-    )
-    trailing_stop_positive_offset_medium_quality = DecimalParameter(
-        0.015, 0.06, default=0.03, space="sell", optimize=True, load=True
-    )
-
-    # === NEUE ADVANCED PARAMETERS ===
-    # Confluence Analysis
-    confluence_enabled = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
-    confluence_threshold = DecimalParameter(
-        2.0, 4.0, default=2.5, space="buy", optimize=True, load=True
-    )  # War 3.0
-
-    # Volume Analysis
-    volume_analysis_enabled = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
-    volume_strength_threshold = DecimalParameter(
-        1.1, 2.0, default=1.3, space="buy", optimize=True, load=True
-    )
-    volume_pressure_threshold = IntParameter(
-        1, 3, default=1, space="buy", optimize=True, load=True
-    )  # War 2
-
-    # Momentum Analysis
-    momentum_analysis_enabled = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
-    momentum_quality_threshold = IntParameter(
-        2, 4, default=2, space="buy", optimize=True, load=True
-    )  # War 3
-
-    # Market Structure Analysis
-    structure_analysis_enabled = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
-    structure_score_threshold = DecimalParameter(
-        -2.0, 5.0, default=0.5, space="buy", optimize=True, load=True
-    )
-
-    # Ultimate Score
+    confluence_enabled = BooleanParameter(default=True, space="buy", optimize=False, load=True)
+    volume_analysis_enabled = BooleanParameter(default=True, space="buy", optimize=False, load=True)
+    momentum_analysis_enabled = BooleanParameter(default=True, space="buy", optimize=False, load=True)
+    structure_analysis_enabled = BooleanParameter(default=True, space="buy", optimize=False, load=True)
+    # Only drives the `high_quality_setup` plot column, which no entry uses
     ultimate_score_threshold = DecimalParameter(
-        0.5, 3.0, default=1.5, space="buy", optimize=True, load=True
+        0.5, 3.0, default=1.5, space="buy", optimize=False, load=True
     )
 
-    # Advanced Entry Filters
-    require_volume_confirmation = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
-    require_momentum_confirmation = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
-    require_structure_confirmation = BooleanParameter(
-        default=True, space="buy", optimize=False, load=True
-    )
+    # --- Protections (only optimised with `--enable-protections`)
+    cooldown_lookback = IntParameter(1, 48, default=1, space="protection", optimize=True)
+    stop_duration = IntParameter(4, 200, default=4, space="protection", optimize=True)
+    use_stop_protection = BooleanParameter(default=True, space="protection", optimize=True)
 
     # ✅ Replace your old ROI with this:
     minimal_roi = {
@@ -2955,6 +2318,20 @@ class AlexNexusForgeV8AIV2(IStrategy):
         },
     }
 
+    def bot_start(self, **kwargs) -> None:
+        """Store ML models under the configured user_data_dir instead of a path
+        relative to whatever directory the bot happened to be started from."""
+        user_data_dir = self.config.get("user_data_dir") if self.config else None
+        if user_data_dir:
+            predictive_engine.set_models_dir(
+                Path(user_data_dir) / "strategies" / "ml_models"
+            )
+        logger.info(f"[ML] Model directory: {predictive_engine.models_dir}")
+
+    def _is_backtest_like(self) -> bool:
+        runmode = getattr(self.dp, "runmode", None) if self.dp else None
+        return runmode in (RunMode.BACKTEST, RunMode.HYPEROPT, RunMode.PLOT)
+
     # Helper method to check if we have an active position in the opposite direction
     def has_active_trade(self, pair: str, side: str) -> bool:
         """
@@ -3024,18 +2401,15 @@ class AlexNexusForgeV8AIV2(IStrategy):
             if i < window_size:
                 continue
 
-            # Use data up to the previous candle for the rolling window
+            # Levels written at row `window_end` use candles up to and including it.
+            # (iloc's end is exclusive, so the old slice silently dropped that candle.)
             window_end = i - 1
-            window_start = window_end - window_size + 1
-            if window_start < 0:
-                window_start = 0
+            window_start = max(0, window_end - window_size + 1)
 
-            window_data = df.iloc[window_start:window_end]
+            window_data = df.iloc[window_start : window_end + 1]
             mn_period = window_data["low"].min()
             mx_period = window_data["high"].max()
-            current_close = (
-                df["close"].iloc[window_end] if window_end > 0 else df["close"].iloc[0]
-            )
+            current_close = df["close"].iloc[window_end]
 
             if pd.isna(mn_period) or pd.isna(mx_period) or mn_period == mx_period:
                 for key in MML_LEVEL_NAMES:
@@ -3049,13 +2423,12 @@ class AlexNexusForgeV8AIV2(IStrategy):
             for key in MML_LEVEL_NAMES:
                 murrey_levels_data[key][window_end] = levels.get(key, current_close)
 
-        # Interpolate using only past data up to each point
+        # Hold each computed level until the next calculation (forward-fill only).
+        # The old code used expanding().mean(), i.e. the AVERAGE of every level since
+        # the start of the data, so levels lagged further behind price over time and
+        # differed between backtest and live (different history length).
         for key in MML_LEVEL_NAMES:
-            series = pd.Series(murrey_levels_data[key], index=df.index)
-            # Interpolate forward only up to the current point, avoiding future data
-            series = (
-                series.expanding().mean().ffill()
-            )  # Use expanding mean as a safe alternative
+            series = pd.Series(murrey_levels_data[key], index=df.index).ffill()
             murrey_levels_data[key] = series.tolist()
 
         return {
@@ -3174,22 +2547,12 @@ class AlexNexusForgeV8AIV2(IStrategy):
         """
         Define additional pairs for correlation analysis
         """
-        pairs = []
-
-        # Add BTC for correlation analysis (if not already trading BTC)
-        if self.timeframe:
-            pairs.append(("BTC/USDT:USDT", self.timeframe))
-
-        # Add major market indicators
-        pairs.extend(
-            [
-                ("BTC/USDT:USDT", self.timeframe),
-                ("ETH/USDT:USDT", self.timeframe),
-                ("BNB/USDT:USDT", self.timeframe),
-            ]
-        )
-
-        return pairs
+        # (BTC used to be listed twice)
+        return [
+            ("BTC/USDT:USDT", self.timeframe),
+            ("ETH/USDT:USDT", self.timeframe),
+            ("BNB/USDT:USDT", self.timeframe),
+        ]
 
     def custom_stoploss(
         self,
@@ -3198,22 +2561,31 @@ class AlexNexusForgeV8AIV2(IStrategy):
         current_time: datetime,
         current_rate: float,
         current_profit: float,
+        after_fill: bool = False,
         **kwargs,
-    ) -> float:
-        dataframe, _ = self.dp.get_analyzed_dataframe(
-            pair=pair, timeframe=self.timeframe
-        )
+    ) -> Optional[float]:
+        """ATR stop + tiered profit lock.
 
-        if dataframe.empty or "atr" not in dataframe.columns:
-            return self.stoploss  # Use strategy stoploss (-0.15) as fallback
+        Fixes vs. the previous version:
+        * the profit lock used min() of two negative numbers, i.e. it picked the
+          LOOSER stop, and was then overridden by the -6% "ceiling" anyway, so the
+          stop could never trail tighter than 6% below price;
+        * the ATR distance ignored leverage (stoploss in freqtrade is risk on the
+          leveraged position: 1% price move at 5x = 5%);
+        * profit locks are now converted with stoploss_from_open, because the
+          return value of custom_stoploss is relative to current_rate, not entry.
+        """
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+        if dataframe is None or dataframe.empty or "atr" not in dataframe.columns:
+            return None  # keep the current stop
 
         atr = dataframe["atr"].iat[-1]
-        if pd.isna(atr) or atr <= 0:
-            return self.stoploss  # Fallback to -0.15
+        if pd.isna(atr) or atr <= 0 or current_rate <= 0:
+            return None
 
+        leverage = trade.leverage or 1.0
         atr_percent = atr / current_rate
 
-        # Profit-based multiplier adjustment
         if current_profit > 0.15:
             multiplier = 1.0
         elif current_profit > 0.08:
@@ -3223,45 +2595,36 @@ class AlexNexusForgeV8AIV2(IStrategy):
         else:
             multiplier = 1.6
 
-        calculated_stoploss = -(
-            atr_percent * multiplier * self.atr_stoploss_multiplier.value
+        atr_distance = atr_percent * multiplier * self.atr_stoploss_multiplier.value * leverage
+        # ceiling = closest allowed stop, maximum = widest allowed stop.
+        # Never wider than the static stoploss: after a safety order fills,
+        # freqtrade calls this with after_fill=True and lets the stop WIDEN, which
+        # would otherwise jump to atr_stoploss_maximum on the now larger position.
+        min_distance = abs(self.atr_stoploss_ceiling.value)
+        max_distance = min(abs(self.atr_stoploss_maximum.value), abs(self.stoploss))
+        distance = float(np.clip(atr_distance, min_distance, max_distance))
+
+        # Tiered profit lock (profit to keep if price reverses)
+        lock_profit = 0.0
+        if current_profit > self.trailing_stop_positive_offset:
+            lock_profit = current_profit - self.trailing_stop_positive
+        elif current_profit > 0.02:
+            lock_profit = current_profit - 0.01
+        elif current_profit > 0.015:
+            lock_profit = current_profit - 0.015
+
+        if lock_profit > 0:
+            lock_distance = stoploss_from_open(
+                lock_profit, current_profit, is_short=trade.is_short, leverage=leverage
+            )
+            if lock_distance > 0:
+                distance = min(distance, lock_distance)
+
+        logger.debug(
+            f"{pair} Custom SL: -{distance:.4f} | ATR%: {atr_percent:.4f} | "
+            f"Lev: {leverage:.1f} | Profit: {current_profit:.4f} | Lock: {lock_profit:.4f}"
         )
-
-        # Initialize trailing_offset
-        trailing_offset = 0.0
-
-        # Enhanced trailing logic with multiple profit levels
-        if current_profit > 0.01:  # Start trailing at 1% profit instead of 3%
-            if current_profit > self.trailing_stop_positive_offset:  # 0.03 (3% profit)
-                # Full trailing at 3%+ profit
-                trailing_offset = max(
-                    0, current_profit - self.trailing_stop_positive
-                )  # Trail 0.5% below peak
-            elif current_profit > 0.02:  # 2% profit
-                # Moderate trailing at 2-3% profit
-                trailing_offset = max(0, current_profit - 0.01)  # Trail 1% below peak
-            else:  # 1-2% profit
-                # Minimal trailing at 1-2% profit
-                trailing_offset = max(
-                    0, current_profit - 0.015
-                )  # Trail 1.5% below peak
-
-            # Apply trailing adjustment to calculated stoploss
-            if trailing_offset > 0:
-                calculated_stoploss = min(
-                    calculated_stoploss, -trailing_offset
-                )  # Trail up in profit
-
-        final_stoploss = max(
-            min(calculated_stoploss, self.atr_stoploss_ceiling.value),
-            self.atr_stoploss_maximum.value,
-        )
-
-        logger.info(
-            f"{pair} Custom SL: {final_stoploss:.3f} | ATR: {atr:.6f} | "
-            f"Profit: {current_profit:.3f} | Trailing: {trailing_offset:.3f}"
-        )
-        return final_stoploss
+        return -distance
 
     def leverage(
         self,
@@ -3282,41 +2645,48 @@ class AlexNexusForgeV8AIV2(IStrategy):
                 f"{pair} Not enough data ({len(dataframe)} candles) to calculate dynamic leverage (requires {window_size}). Using proposed: {proposed_leverage}"
             )
             return proposed_leverage
-        close_prices_series = dataframe["close"].tail(window_size)
-        high_prices_series = dataframe["high"].tail(window_size)
-        low_prices_series = dataframe["low"].tail(window_size)
+        # The old code passed single Series to talib.abstract, which returns plain
+        # arrays (MACD returns a tuple), so the `isinstance(macd_output, DataFrame)`
+        # check was always False and the MACD rule never applied. Passing the OHLCV
+        # frame returns pandas objects consistently.
+        tail = dataframe.tail(window_size)
         base_leverage = self.leverage_base.value
-        rsi_array = ta.RSI(close_prices_series, timeperiod=14)
-        atr_array = ta.ATR(
-            high_prices_series, low_prices_series, close_prices_series, timeperiod=14
-        )
-        sma_array = ta.SMA(close_prices_series, timeperiod=20)
-        macd_output = ta.MACD(
-            close_prices_series, fastperiod=12, slowperiod=26, signalperiod=9
+
+        def _last(values, default: float) -> float:
+            arr = np.asarray(values, dtype=float)
+            arr = arr[~np.isnan(arr)]
+            return float(arr[-1]) if arr.size else default
+
+        current_rsi = _last(ta.RSI(tail, timeperiod=14), 50.0)
+        current_atr = _last(ta.ATR(tail, timeperiod=14), 0.0)
+        current_sma = _last(ta.SMA(tail, timeperiod=20), current_rate)
+        macd_output = ta.MACD(tail, fastperiod=12, slowperiod=26, signalperiod=9)
+        current_macd_hist = (
+            _last(macd_output["macdhist"], 0.0)
+            if isinstance(macd_output, pd.DataFrame) and "macdhist" in macd_output
+            else 0.0
         )
 
-        current_rsi = (
-            rsi_array[-1]
-            if rsi_array.size > 0 and not np.isnan(rsi_array[-1])
-            else 50.0
+        high_volatility = (
+            current_atr > 0
+            and current_rate > 0
+            and (current_atr / current_rate) > self.leverage_atr_threshold_pct.value
         )
-        current_atr = (
-            atr_array[-1] if atr_array.size > 0 and not np.isnan(atr_array[-1]) else 0.0
-        )
-        current_sma = (
-            sma_array[-1]
-            if sma_array.size > 0 and not np.isnan(sma_array[-1])
-            else current_rate
-        )
-        current_macd_hist = 0.0
 
-        if isinstance(macd_output, pd.DataFrame):
-            if not macd_output.empty and "macdhist" in macd_output.columns:
-                valid_macdhist_series = macd_output["macdhist"].dropna()
-                if not valid_macdhist_series.empty:
-                    current_macd_hist = valid_macdhist_series.iloc[-1]
+        # Apply rules based on indicators (shorts mirror the long rules; previously
+        # shorts always got the flat base leverage)
+        if side == "short":
+            if current_rsi > self.leverage_rsi_high.value:
+                base_leverage *= self.leverage_long_increase_factor.value
+            elif current_rsi < self.leverage_rsi_low.value:
+                base_leverage *= self.leverage_long_decrease_factor.value
+            if high_volatility:
+                base_leverage *= self.leverage_volatility_decrease_factor.value
+            if current_macd_hist < 0:
+                base_leverage *= self.leverage_long_increase_factor.value
+            if current_sma > 0 and current_rate > current_sma:
+                base_leverage *= self.leverage_long_decrease_factor.value
 
-        # Apply rules based on indicators
         if side == "long":
             if current_rsi < self.leverage_rsi_low.value:
                 base_leverage *= self.leverage_long_increase_factor.value
@@ -3346,24 +2716,26 @@ class AlexNexusForgeV8AIV2(IStrategy):
         """
         ULTIMATE indicator calculations with advanced market analysis
         """
-        # === ML ASSET STARTUP CHECK ===
-        pair = metadata["pair"]
-        if hasattr(self, "predictive_engine") and self.predictive_engine is not None:
-            # Mark pair as trained if assets exist (startup optimization)
-            self.predictive_engine.mark_trained_if_assets(pair)
-
         # === EXTERNAL DATA INTEGRATION ===
         try:
-            # Add BTC data for correlation analysis using informative pairs
+            # Add BTC close aligned by candle date. (The old code took the last N BTC
+            # rows by position, which misaligns whenever the two series don't end on
+            # the same candle or have gaps.)
             if metadata["pair"] != "BTC/USDT:USDT":
                 btc_info = self.dp.get_pair_dataframe("BTC/USDT:USDT", self.timeframe)
-                if not btc_info.empty and len(btc_info) >= len(dataframe):
-                    # Take only the last N rows to match our dataframe length
-                    btc_close_data = (
-                        btc_info["close"].tail(len(dataframe)).reset_index(drop=True)
+                if btc_info is not None and not btc_info.empty:
+                    btc_map = (
+                        btc_info[["date", "close"]]
+                        .drop_duplicates("date")
+                        .rename(columns={"close": "btc_close"})
                     )
-                    dataframe["btc_close"] = btc_close_data.values
-                    logger.info(
+                    dataframe = dataframe.drop(
+                        columns=["btc_close"], errors="ignore"
+                    ).merge(btc_map, on="date", how="left")
+                    dataframe["btc_close"] = (
+                        dataframe["btc_close"].ffill().fillna(dataframe["close"])
+                    )
+                    logger.debug(
                         f"{metadata['pair']} BTC correlation data added successfully"
                     )
                 else:
@@ -3406,19 +2778,27 @@ class AlexNexusForgeV8AIV2(IStrategy):
         dataframe["DI_cutoff"] = 0
 
         # === EXTREMA DETECTION ===
-        extrema_order = self.indicator_extrema_order.value
-        dataframe["maxima"] = (
-            dataframe["close"]
-            == dataframe["close"].shift(1).rolling(window=extrema_order).max()
-        ).astype(int)
-        dataframe["minima"] = (
-            dataframe["close"]
-            == dataframe["close"].shift(1).rolling(window=extrema_order).min()
-        ).astype(int)
-
-        dataframe["s_extrema"] = 0
-        dataframe.loc[dataframe["minima"] == 1, "s_extrema"] = -1
-        dataframe.loc[dataframe["maxima"] == 1, "s_extrema"] = 1
+        # maxima = close makes a new N-candle high (live-safe local top),
+        # minima = new N-candle low. The old test was `close == previous max`, an
+        # exact float equality that is almost never true, so every exit requiring
+        # maxima/minima == 1 was effectively dead.
+        # Every candidate order is precomputed so hyperopt can select one per epoch
+        # (`.range` is the full range in hyperopt, only the current value otherwise).
+        close = dataframe["close"]
+        extrema_cols = {}
+        for order in self.indicator_extrema_order.range:
+            extrema_cols[f"_ext_max_{order}"] = (
+                close > close.shift(1).rolling(window=order).max()
+            ).astype(int)
+            extrema_cols[f"_ext_min_{order}"] = (
+                close < close.shift(1).rolling(window=order).min()
+            ).astype(int)
+        dataframe = pd.concat(
+            [dataframe.drop(columns=list(extrema_cols), errors="ignore"),
+             pd.DataFrame(extrema_cols, index=dataframe.index)],
+            axis=1,
+        )
+        self._select_extrema(dataframe)
 
         # === HEIKIN-ASHI ===
         dataframe["ha_close"] = (
@@ -3691,8 +3071,10 @@ class AlexNexusForgeV8AIV2(IStrategy):
         dataframe["ultimate_score"] = dataframe["ultimate_score"].clip(0, 5) / 5
 
         # === FINAL QUALITY CHECKS ===
+        # ultimate_score was normalised to 0..1 above (clip(0, 5) / 5) but compared to
+        # a threshold in 0.5..3.0, so this could never be true. Scale the threshold.
         dataframe["high_quality_setup"] = (
-            (dataframe["ultimate_score"] > self.ultimate_score_threshold.value)
+            (dataframe["ultimate_score"] > self.ultimate_score_threshold.value / 5)
             & (dataframe["signal_strength"] >= 5)
             & (dataframe["volume_strength"] > 1.1)
             & (dataframe["rsi"] > 30)
@@ -3710,6 +3092,55 @@ class AlexNexusForgeV8AIV2(IStrategy):
                 f"{metadata['pair']} Ultimate Score: {latest_score:.3f}, Signal Strength: {latest_signal}"
             )
 
+        # === ADVANCED PREDICTIVE ANALYSIS ===
+        try:
+            pair = metadata.get("pair", "UNKNOWN")
+            dataframe = calculate_advanced_predictive_signals(
+                dataframe,
+                pair,
+                backtest_mode=self._is_backtest_like(),
+                train_short_model=self.can_short,
+            )
+            dataframe = calculate_quantum_momentum_analysis(dataframe)
+            dataframe = calculate_neural_pattern_recognition(dataframe)
+
+            logger.info(f"{pair} Advanced predictive analysis completed")
+        except Exception as e:
+            logger.warning(f"Advanced predictive analysis failed: {e}")
+            dataframe["ml_entry_probability"] = 0.5
+            dataframe["ml_short_probability"] = 0.5
+            dataframe["ml_enhanced_score"] = dataframe.get("ultimate_score", 0.5)
+            dataframe["ml_enhanced_short_score"] = 1 - dataframe.get("ultimate_score", 0.5)
+            dataframe["ml_high_confidence"] = 0
+            dataframe["ml_ultra_confidence"] = 0
+            dataframe["quantum_momentum_coherence"] = 0.5
+            dataframe["momentum_entanglement"] = 0.5
+            dataframe["quantum_tunnel_up_prob"] = 0.5
+            dataframe["neural_pattern_score"] = 0.5
+
+        return dataframe
+
+    def _select_extrema(self, dataframe: pd.DataFrame) -> None:
+        """Point maxima/minima/s_extrema at the precomputed columns for the
+        current indicator_extrema_order value (works per hyperopt epoch)."""
+        order = self.indicator_extrema_order.value
+        if f"_ext_max_{order}" not in dataframe.columns:
+            return
+        dataframe["maxima"] = dataframe[f"_ext_max_{order}"]
+        dataframe["minima"] = dataframe[f"_ext_min_{order}"]
+        dataframe["s_extrema"] = 0
+        dataframe.loc[dataframe["minima"] == 1, "s_extrema"] = -1
+        dataframe.loc[dataframe["maxima"] == 1, "s_extrema"] = 1
+
+    def _populate_regime_signals(self, dataframe: pd.DataFrame) -> pd.DataFrame:
+        """Regime-change columns used by custom_exit and adjust_trade_position.
+
+        Moved out of populate_indicators: these are cheap and depend only on
+        hyperopt parameters, and populate_indicators runs only once per hyperopt,
+        so the flash/volume/sentiment/sensitivity parameters never changed
+        between epochs. They are no longer ML inputs either, so tuning them can't
+        silently change what the model learned.
+        """
         # ===========================================
         # REGIME CHANGE DETECTION
         # ===========================================
@@ -3737,16 +3168,18 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
             volume_ma20 = dataframe["volume"].rolling(20).mean()
             volume_multiplier = self.volume_spike_multiplier.value
-            dataframe["volume_spike"] = dataframe["volume"] > (
+            # Separate column: this used to overwrite the 1.5x "volume_spike" from the
+            # confluence module with a 3x boolean version.
+            dataframe["regime_volume_spike"] = dataframe["volume"] > (
                 volume_ma20 * volume_multiplier
             )
 
             # Volume + Bewegung kombiniert
             dataframe["volume_pump"] = (
-                dataframe["volume_spike"] & dataframe["flash_pump"]
+                dataframe["regime_volume_spike"] & dataframe["flash_pump"]
             )
             dataframe["volume_dump"] = (
-                dataframe["volume_spike"] & dataframe["flash_dump"]
+                dataframe["regime_volume_spike"] & dataframe["flash_dump"]
             )
 
             # ===========================================
@@ -3800,7 +3233,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
             regime_signals = [
                 "flash_move",
-                "volume_spike",
+                "regime_volume_spike",
                 "sentiment_shift_bull",
                 "sentiment_shift_bear",
                 "btc_flash_pump",
@@ -3829,29 +3262,14 @@ class AlexNexusForgeV8AIV2(IStrategy):
             # Falls Regime Detection deaktiviert
             dataframe["flash_pump"] = False
             dataframe["flash_dump"] = False
+            dataframe["sentiment_shift_bull"] = False
+            dataframe["sentiment_shift_bear"] = False
+            dataframe["btc_flash_pump"] = False
+            dataframe["btc_flash_dump"] = False
             dataframe["volume_pump"] = False
             dataframe["volume_dump"] = False
             dataframe["regime_alert"] = False
             dataframe["regime_change_intensity"] = 0.0
-
-        # === ADVANCED PREDICTIVE ANALYSIS ===
-        try:
-            pair = metadata.get("pair", "UNKNOWN")
-            dataframe = calculate_advanced_predictive_signals(dataframe, pair)
-            dataframe = calculate_quantum_momentum_analysis(dataframe)
-            dataframe = calculate_neural_pattern_recognition(dataframe)
-
-            logger.info(f"{pair} Advanced predictive analysis completed")
-        except Exception as e:
-            logger.warning(f"Advanced predictive analysis failed: {e}")
-            dataframe["ml_entry_probability"] = 0.5
-            dataframe["ml_enhanced_score"] = dataframe.get("ultimate_score", 0.5)
-            dataframe["ml_high_confidence"] = 0
-            dataframe["ml_ultra_confidence"] = 0
-            dataframe["quantum_momentum_coherence"] = 0.5
-            dataframe["momentum_entanglement"] = 0.5
-            dataframe["quantum_tunnel_up_prob"] = 0.5
-            dataframe["neural_pattern_score"] = 0.5
 
         return dataframe
 
@@ -3861,6 +3279,10 @@ class AlexNexusForgeV8AIV2(IStrategy):
         """
         AI-CENTRIC ENTRY LOGIC - Simplified and functional
         """
+
+        # Hyperopt-dependent signals (re-evaluated every epoch)
+        self._select_extrema(dataframe)
+        dataframe = self._populate_regime_signals(dataframe)
 
         # ===========================================
         # INITIALIZE ENTRY COLUMNS
@@ -3881,6 +3303,12 @@ class AlexNexusForgeV8AIV2(IStrategy):
         ml_enhanced = dataframe.get(
             "ml_enhanced_score", pd.Series(0.5, index=dataframe.index)
         )
+        # Shorts use the dedicated short model (P(profitable down-move)). The old
+        # logic shorted whenever the LONG model was unenthusiastic (ml_prob < 0.48),
+        # which is not the same thing as expecting a drop. Without a short model this
+        # falls back to exactly the old behaviour (1 - long probability).
+        ml_short = dataframe.get("ml_short_probability", 1 - ml_prob)
+        ml_enhanced_short = dataframe.get("ml_enhanced_short_score", 1 - ml_enhanced)
 
         # ===========================================
         # BASIC SAFETY FILTERS (Minimal Requirements)
@@ -3934,16 +3362,16 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
         # TIER 1: Ultra AI Short Confidence
         ai_ultra_short = (
-            (ml_prob < 0.3)  # Low probability = good for shorts
-            & (ml_enhanced < 0.35)
+            (ml_short > 0.7)
+            & (ml_enhanced_short > 0.65)
             & basic_safety
             & (dataframe["close"] < dataframe["ema50"])  # Below EMA for shorts
         )
 
         # TIER 2: High AI Short Confidence
         ai_high_short = (
-            (ml_prob < 0.4)
-            & (ml_enhanced < 0.45)
+            (ml_short > 0.6)
+            & (ml_enhanced_short > 0.55)
             & basic_safety
             & (dataframe["close"] < dataframe["ema50"])
             & ~ai_ultra_short
@@ -3951,7 +3379,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
         # TIER 3: Standard AI Short
         ai_standard_short = (
-            (ml_prob < 0.48)
+            (ml_short > 0.52)
             & basic_safety
             & (dataframe["close"] < dataframe["ema50"])
             & ~(ai_ultra_short | ai_high_short)
@@ -3959,7 +3387,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
         # TIER 4: Opportunistic Short
         ai_opportunistic_short = (
-            (ml_prob < 0.52)
+            (ml_short > 0.48)
             & (dataframe["rsi"] > 65)  # Overbought opportunity
             & (dataframe["volume"] > dataframe["avg_volume"] * 1.5)
             & basic_safety
@@ -3993,7 +3421,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
         # Enhanced short entries
         ai_enhanced_short = (
-            (ml_prob < 0.4)
+            (ml_short > 0.6)
             & (quantum_coherence < 0.4)  # Inverted for shorts
             & (neural_pattern < 0.4)  # Inverted for shorts
             & (ml_agreement > 0.6)  # Models agree on direction
@@ -4066,41 +3494,41 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
         # SHORT ENTRIES (If shorting enabled)
 
+        # Shorts are collected separately so a conflict can be resolved without the
+        # short's entry_type/tag overwriting the long's. (Before, entry_type was
+        # overwritten by the short, so the comparison always kept the LONG while the
+        # tag still said "..._short".)
+        short_signal = pd.Series(0, index=dataframe.index)
+        short_type = pd.Series(0, index=dataframe.index)
+        short_tag = pd.Series("", index=dataframe.index, dtype=object)
         if self.can_short:
-            # Enhanced AI Short (Priority 1)
-            dataframe.loc[ai_enhanced_short, "enter_short"] = 1
-            dataframe.loc[ai_enhanced_short, "entry_type"] = 25
-            dataframe.loc[ai_enhanced_short, "enter_tag"] = "ai_enhanced_short"
+            for cond, etype, tag in (
+                (ai_enhanced_short, 25, "ai_enhanced_short"),
+                (ai_ultra_short, 24, "ai_ultra_short"),
+                (ai_high_short, 23, "ai_high_short"),
+                (ai_standard_short, 22, "ai_standard_short"),
+                (ai_opportunistic_short, 21, "ai_opportunistic_short"),
+                (technical_short, 20, "technical_short"),
+            ):
+                mask = cond.fillna(False) & (short_signal == 0)
+                short_signal[mask] = 1
+                short_type[mask] = etype
+                short_tag[mask] = tag
 
-            # Ultra AI Short (Priority 2)
-            mask = ai_ultra_short & (dataframe["enter_short"] == 0)
-            dataframe.loc[mask, "enter_short"] = 1
-            dataframe.loc[mask, "entry_type"] = 24
-            dataframe.loc[mask, "enter_tag"] = "ai_ultra_short"
-
-            # High AI Short (Priority 3)
-            mask = ai_high_short & (dataframe["enter_short"] == 0)
-            dataframe.loc[mask, "enter_short"] = 1
-            dataframe.loc[mask, "entry_type"] = 23
-            dataframe.loc[mask, "enter_tag"] = "ai_high_short"
-
-            # Standard AI Short (Priority 4)
-            mask = ai_standard_short & (dataframe["enter_short"] == 0)
-            dataframe.loc[mask, "enter_short"] = 1
-            dataframe.loc[mask, "entry_type"] = 22
-            dataframe.loc[mask, "enter_tag"] = "ai_standard_short"
-
-            # Opportunistic AI Short (Priority 5)
-            mask = ai_opportunistic_short & (dataframe["enter_short"] == 0)
-            dataframe.loc[mask, "enter_short"] = 1
-            dataframe.loc[mask, "entry_type"] = 21
-            dataframe.loc[mask, "enter_tag"] = "ai_opportunistic_short"
-
-            # Technical Short (Priority 6 - Fallback)
-            mask = technical_short & (dataframe["enter_short"] == 0)
-            dataframe.loc[mask, "enter_short"] = 1
-            dataframe.loc[mask, "entry_type"] = 20
-            dataframe.loc[mask, "enter_tag"] = "technical_short"
+        # Resolve long/short conflicts by tier (x5 = enhanced ... x0 = technical);
+        # ties go to the long.
+        long_rank = (dataframe["entry_type"] % 10).where(dataframe["enter_long"] == 1, -1)
+        short_rank = (short_type % 10).where(short_signal == 1, -1)
+        conflict_mask = (dataframe["enter_long"] == 1) & (short_signal == 1)
+        if conflict_mask.any():
+            logger.debug(
+                f"{metadata['pair']} Resolving {conflict_mask.sum()} conflicting signals"
+            )
+        take_short = (short_signal == 1) & (short_rank > long_rank)
+        dataframe.loc[take_short, "enter_long"] = 0
+        dataframe.loc[take_short, "enter_short"] = 1
+        dataframe.loc[take_short, "entry_type"] = short_type[take_short]
+        dataframe.loc[take_short, "enter_tag"] = short_tag[take_short]
 
         # ===========================================
         # ENTRY DEBUGGING & MONITORING
@@ -4151,29 +3579,6 @@ class AlexNexusForgeV8AIV2(IStrategy):
                     logger.warning(
                         f"⚠️  {metadata['pair']} Using fallback - AI indicators may not be working!"
                     )
-
-        # ===========================================
-        # FINAL SAFETY CHECK
-        # ===========================================
-
-        # Ensure we don't have conflicting signals
-        conflict_mask = (dataframe["enter_long"] == 1) & (dataframe["enter_short"] == 1)
-        if conflict_mask.any():
-            logger.warning(
-                f"{metadata['pair']} Resolving {conflict_mask.sum()} conflicting signals"
-            )
-            # Resolve conflicts: prefer higher entry_type (more confident signal)
-            long_priority = dataframe["entry_type"].where(
-                dataframe["enter_long"] == 1, 0
-            )
-            short_priority = dataframe["entry_type"].where(
-                dataframe["enter_short"] == 1, 0
-            )
-
-            # Keep the higher priority signal
-            keep_long = long_priority >= short_priority
-            dataframe.loc[conflict_mask & ~keep_long, "enter_long"] = 0
-            dataframe.loc[conflict_mask & keep_long, "enter_short"] = 0
 
         return dataframe
 
@@ -4240,16 +3645,24 @@ class AlexNexusForgeV8AIV2(IStrategy):
         # AI-BASED INTELLIGENT EXIT SIGNALS
         # ===========================================
 
-        # Calculate AI prediction stability and direction indicators
-        current_profit_signal = pd.Series([False] * len(df), index=df.index)
-        ai_stability_signal = pd.Series([False] * len(df), index=df.index)
-        ai_degradation_signal = pd.Series([False] * len(df), index=df.index)
+        # Long and short AI signals are now kept SEPARATE. Previously
+        # ai_degradation_signal = long_exit | short_exit was applied to BOTH sides:
+        # "ml_prob > 0.55" (bad for shorts) therefore closed every healthy long, and
+        # "ml_prob < 0.45" closed every healthy short.
+        false_series = pd.Series(False, index=df.index)
+        current_profit_signal = false_series.copy()
+        long_stability_signal = false_series.copy()
+        short_stability_signal = false_series.copy()
+        long_degradation_signal = false_series.copy()
+        short_degradation_signal = false_series.copy()
+
+        ml_prob = df.get("ml_entry_probability", pd.Series(0.5, index=df.index))
+        ml_enhanced = df.get("ml_enhanced_score", pd.Series(0.5, index=df.index))
+        ml_short = df.get("ml_short_probability", 1 - ml_prob)
+        ml_enhanced_short = df.get("ml_enhanced_short_score", 1 - ml_enhanced)
 
         try:
             # 1. AI STABILITY ANALYSIS
-            # Check if ML predictions are stable and maintain direction
-            ml_prob = df.get("ml_entry_probability", pd.Series([0.5] * len(df)))
-            ml_enhanced = df.get("ml_enhanced_score", pd.Series([0.5] * len(df)))
 
             # Calculate AI stability metrics
             ml_prob_sma_5 = ml_prob.rolling(5).mean().fillna(ml_prob)
@@ -4265,13 +3678,16 @@ class AlexNexusForgeV8AIV2(IStrategy):
                 & (ml_prob > ml_prob.shift(1))  # Predictions improving or stable
             )
 
-            # For SHORT positions: AI should maintain low probability (<0.4) for continuation
+            # For SHORT positions: the short model should stay confident
+            ml_short_sma_5 = ml_short.rolling(5).mean().fillna(ml_short)
+            ml_short_sma_10 = ml_short.rolling(10).mean().fillna(ml_short)
+            ml_short_std_5 = ml_short.rolling(5).std().fillna(0.1)
             ai_short_stable = (
-                (ml_prob < 0.4)
-                & (ml_prob_sma_5 < 0.4)  # Recent average supports short
-                & (ml_prob_std_5 < 0.15)  # Low volatility in predictions (stable)
-                & (ml_enhanced < 0.35)  # Enhanced score supports direction
-                & (ml_prob < ml_prob.shift(1))  # Predictions improving toward short
+                (ml_short > 0.6)
+                & (ml_short_sma_5 > 0.6)
+                & (ml_short_std_5 < 0.15)
+                & (ml_enhanced_short > 0.65)
+                & (ml_short > ml_short.shift(1))
             )
 
             # 2. AI DEGRADATION DETECTION
@@ -4293,18 +3709,11 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
             # For SHORT positions: Exit when AI confidence drops for shorts
             ai_short_degradation = (
-                # Rapid confidence loss for shorts
-                (ml_prob > 0.55)  # Prediction moved above neutral
-                | (ml_prob > ml_prob.shift(2) + 0.2)  # 20% rise in 2 candles
-                | (
-                    ml_prob_sma_5 > ml_prob_sma_10 + 0.1
-                )  # Trend improving (bad for shorts)
-                |
-                # High prediction volatility (uncertainty)
-                (ml_prob_std_5 > 0.25)
-                |
-                # Enhanced score contradiction
-                ((ml_prob < 0.4) & (ml_enhanced > 0.6))  # Conflicting signals
+                (ml_short < 0.45)
+                | (ml_short < ml_short.shift(2) - 0.2)
+                | (ml_short_sma_5 < ml_short_sma_10 - 0.1)
+                | (ml_short_std_5 > 0.25)
+                | ((ml_short > 0.6) & (ml_enhanced_short < 0.4))
             )
 
             # 3. COMBINED AI EXIT LOGIC
@@ -4314,9 +3723,10 @@ class AlexNexusForgeV8AIV2(IStrategy):
             # Exit SHORT when AI shows degradation AND no stability
             ai_short_exit = ai_short_degradation & (~ai_short_stable)
 
-            # Store signals for use in exit combinations
-            ai_stability_signal = ai_long_stable | ai_short_stable
-            ai_degradation_signal = ai_long_exit | ai_short_exit
+            long_stability_signal = ai_long_stable
+            short_stability_signal = ai_short_stable
+            long_degradation_signal = ai_long_exit
+            short_degradation_signal = ai_short_exit
 
             # Simple profit conditions (backup to AI logic)
             rolling_high = df["high"].rolling(20).max()
@@ -4337,16 +3747,10 @@ class AlexNexusForgeV8AIV2(IStrategy):
                 & (df["close"] < df["high"])  # Didn't close at high
             )
 
-            # Combine AI exits with traditional profit-taking
+            # Traditional long profit-taking, only when the long model isn't stable
             current_profit_signal = (
-                ai_degradation_signal  # AI degradation (primary)
-                | (
-                    profit_exit_signal & (~ai_stability_signal)
-                )  # Profit exit only if AI unstable
-                | (
-                    resistance_profit_exit & (~ai_stability_signal)
-                )  # Resistance exit only if AI unstable
-            )
+                profit_exit_signal | resistance_profit_exit
+            ) & (~long_stability_signal)
 
         except Exception as e:
             # If any error, continue with normal exit logic
@@ -4408,7 +3812,9 @@ class AlexNexusForgeV8AIV2(IStrategy):
             & (df["close"] < df["open"])
             & (df["low"] < df["low"].shift(1))
             & (df["close"] < df["close"].rolling(3).mean())
-            & (df["momentum_quality"] < 0)  # Added momentum check
+            # momentum_quality is a 0..5 count, so the old "< 0" never fired and this
+            # whole exit was dead.
+            & (df["momentum_quality"] <= 1)
         )
 
         # 3. Momentum Divergence
@@ -4455,17 +3861,15 @@ class AlexNexusForgeV8AIV2(IStrategy):
         # AI-ENHANCED EXIT COMBINATION
         # ===========================================
 
+        ml_prob_sma_20 = ml_prob.rolling(20).mean().fillna(ml_prob)
+        ml_trend_strength = (ml_prob - ml_prob_sma_20).abs()
+        ml_short_sma_20 = ml_short.rolling(20).mean().fillna(ml_short)
+        ml_short_trend_strength = (ml_short - ml_short_sma_20).abs()
+
         try:
-            # Get ML prediction history for stability analysis
-            ml_prob = df.get("ml_entry_probability", pd.Series([0.5] * len(df)))
-
-            # Calculate AI trend and stability over longer period
-            ml_prob_sma_20 = ml_prob.rolling(20).mean().fillna(ml_prob)
-            ml_trend_strength = (ml_prob - ml_prob_sma_20).abs()
-
             # AI Override Logic: Don't exit if AI shows strong consistent signals
             ai_override_long = (
-                ai_stability_signal  # AI is stable
+                long_stability_signal  # AI is stable
                 & (ml_prob > 0.7)  # High confidence for long
                 & (ml_trend_strength < 0.1)  # Low deviation from 20-period average
             )
@@ -4484,10 +3888,10 @@ class AlexNexusForgeV8AIV2(IStrategy):
             # Final AI-enhanced exit decision
             any_long_exit = (
                 # AI degradation signal (highest priority - always exit)
-                ai_degradation_signal
+                long_degradation_signal
                 |
                 # Traditional profit-taking when AI not stable
-                (current_profit_signal & (~ai_stability_signal))
+                current_profit_signal
                 |
                 # Traditional MML exits unless AI strongly overrides
                 (traditional_mml_exits & (~ai_override_long))
@@ -4495,16 +3899,8 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
             # Log AI decision for debugging (only when signal changes)
             if len(df) > 1:
-                current_ai_exit = (
-                    ai_degradation_signal.iloc[-1]
-                    if len(ai_degradation_signal) > 0
-                    else False
-                )
-                current_ai_stable = (
-                    ai_stability_signal.iloc[-1]
-                    if len(ai_stability_signal) > 0
-                    else False
-                )
+                current_ai_exit = bool(long_degradation_signal.iloc[-1])
+                current_ai_stable = bool(long_stability_signal.iloc[-1])
                 current_ml_prob = ml_prob.iloc[-1] if len(ml_prob) > 0 else 0.5
                 current_ai_override = (
                     ai_override_long.iloc[-1] if len(ai_override_long) > 0 else False
@@ -4525,7 +3921,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
                     or current_ai_override != last_state.get("ai_override", False)
                 ):
 
-                    logger.info(
+                    logger.debug(
                         f"AI Exit Analysis {pair_key}: "
                         f"ML_Prob={current_ml_prob:.3f}, "
                         f"AI_Exit={current_ai_exit}, "
@@ -4604,7 +4000,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
                 )  # Increased from 1.5
                 & (df["close"] > df["open"])
                 & (df["high"] > df["high"].shift(1))
-                & (df["momentum_quality"] > 0)  # Added momentum check
+                & (df["momentum_quality"] >= 3)
             )
 
             # 3. Momentum Divergence
@@ -4654,9 +4050,9 @@ class AlexNexusForgeV8AIV2(IStrategy):
             try:
                 # AI Override Logic for SHORT positions
                 ai_override_short = (
-                    ai_stability_signal  # AI is stable
-                    & (ml_prob < 0.3)  # High confidence for short
-                    & (ml_trend_strength < 0.1)  # Low deviation from 20-period average
+                    short_stability_signal
+                    & (ml_short > 0.7)  # High confidence for short
+                    & (ml_short_trend_strength < 0.1)
                 )
 
                 # Traditional MML short exit signals
@@ -4672,8 +4068,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
                 # Final AI-enhanced SHORT exit decision
                 any_short_exit = (
-                    # AI degradation signal (always exit shorts too)
-                    ai_degradation_signal
+                    short_degradation_signal
                     |
                     # Traditional short exits unless AI strongly overrides
                     (traditional_short_exits & (~ai_override_short))
@@ -4694,7 +4089,10 @@ class AlexNexusForgeV8AIV2(IStrategy):
                     | short_exit_emergency
                 )
         else:
-            any_short_exit = pd.Series([False] * len(df), index=df.index)
+            any_short_exit = false_series.copy()
+
+        any_long_exit = any_long_exit.fillna(False).astype(bool)
+        any_short_exit = any_short_exit.fillna(False).astype(bool)
 
         # ===========================================
         # COORDINATION WITH ENTRY SIGNALS
@@ -4720,7 +4118,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
         df.loc[any_long_exit, "exit_long"] = 1
 
         # Tags for Long Exits (Priority: AI > Emergency > Structure > Profit)
-        df.loc[any_long_exit & ai_degradation_signal, "exit_tag"] = (
+        df.loc[any_long_exit & long_degradation_signal, "exit_tag"] = (
             "AI_Degradation_Exit"
         )
         df.loc[any_long_exit & long_exit_emergency, "exit_tag"] = (
@@ -4758,7 +4156,7 @@ class AlexNexusForgeV8AIV2(IStrategy):
             df.loc[any_short_exit, "exit_short"] = 1
 
             # Tags for Short Exits (Priority: AI > Emergency > Structure > Profit)
-            df.loc[any_short_exit & ai_degradation_signal, "exit_tag"] = (
+            df.loc[any_short_exit & short_degradation_signal, "exit_tag"] = (
                 "AI_Degradation_Exit"
             )
             df.loc[any_short_exit & short_exit_emergency, "exit_tag"] = (
@@ -4871,6 +4269,182 @@ class AlexNexusForgeV8AIV2(IStrategy):
 
         return dataframe
 
+    # ===========================================
+    # DCA / SAFETY ORDERS
+    # ===========================================
+    def _dca_stake_multiplier(self) -> float:
+        """Total stake of a fully-averaged trade, in units of the initial order."""
+        vs = self.safety_order_volume_scale.value
+        return 1.0 + sum(vs**n for n in range(1, self.max_safety_orders.value + 1))
+
+    def _safety_order_triggers(self) -> list[float]:
+        """Cumulative loss from the first entry at which each safety order fires.
+        With the defaults (-1.8%, step 1.25): -1.8%, -4.05%, -6.86%, ..."""
+        first = self.initial_safety_order_trigger.value
+        step = self.safety_order_step_scale.value
+        triggers, total = [], 0.0
+        for n in range(self.max_safety_orders.value):
+            total += first * step**n
+            triggers.append(total)
+        return triggers
+
+    def custom_stake_amount(
+        self,
+        pair: str,
+        current_time: datetime,
+        current_rate: float,
+        proposed_stake: float,
+        min_stake: Optional[float],
+        max_stake: float,
+        leverage: float,
+        entry_tag: Optional[str],
+        side: str,
+        **kwargs,
+    ) -> float:
+        """Reserve budget for safety orders.
+
+        The configured stake becomes the budget for the WHOLE averaged position, so
+        DCA doesn't silently multiply your risk per trade. Example with one safety
+        order at volume scale 1.4: 100 USDT -> 41.7 initial + 58.3 safety order.
+        """
+        if not self.dca_enabled.value:
+            return proposed_stake
+        stake = proposed_stake / self._dca_stake_multiplier()
+        if min_stake and stake < min_stake:
+            # Budget too small to split: enter with the minimum; safety orders will
+            # then be skipped if they don't fit the remaining balance.
+            stake = min_stake
+        return min(stake, max_stake)
+
+    def adjust_trade_position(
+        self,
+        trade: Trade,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        min_stake: Optional[float],
+        max_stake: float,
+        current_entry_rate: float,
+        current_exit_rate: float,
+        current_entry_profit: float,
+        current_exit_profit: float,
+        **kwargs,
+    ):
+        """Place safety orders when the trade moves against us.
+
+        The DCA parameters existed before but nothing used them (no
+        adjust_trade_position, position_adjustment_enable off). Rules:
+        * trigger N is measured from the FIRST entry price, as a leveraged loss
+          ratio (same scale as current_profit), so averaging down does not reset
+          the distance to the next order;
+        * order N stake = first stake * volume_scale ** N;
+        * at most one safety order per candle, never with an order still open;
+        * skipped during an adverse flash move / volume dump (falling knife) or
+          when the ML model for the trade's side has dropped below dca_ml_guard.
+        """
+        if not self.dca_enabled.value or trade.has_open_orders:
+            return None
+
+        filled_entries = trade.select_filled_orders(trade.entry_side)
+        if not filled_entries:
+            return None
+        safety_done = trade.nr_of_successful_entries - 1
+        if safety_done >= self.max_safety_orders.value:
+            return None
+
+        first_order = filled_entries[0]
+        first_price = first_order.safe_price
+        if not first_price or current_rate <= 0:
+            return None
+        leverage = trade.leverage or 1.0
+        direction = -1.0 if trade.is_short else 1.0
+        loss_from_first = (current_rate / first_price - 1.0) * direction * leverage
+
+        trigger = self._safety_order_triggers()[safety_done]
+        if loss_from_first > trigger:
+            return None
+
+        # One safety order per candle
+        last_fill = filled_entries[-1].order_filled_utc
+        candle = timedelta(seconds=timeframe_to_seconds(self.timeframe))
+        if last_fill and current_time - last_fill < candle:
+            return None
+
+        # Market-condition guards
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=trade.pair, timeframe=self.timeframe)
+        if dataframe is not None and not dataframe.empty:
+            last = dataframe.iloc[-1]
+            adverse = ("flash_pump", "volume_pump") if trade.is_short else ("flash_dump", "volume_dump")
+            if any(bool(last.get(col, False)) for col in adverse):
+                logger.info(f"{trade.pair} DCA skipped: adverse flash move in progress")
+                return None
+            prob_col = "ml_short_probability" if trade.is_short else "ml_entry_probability"
+            prob = last.get(prob_col, 0.5)
+            if pd.notna(prob) and prob < self.dca_ml_guard.value:
+                logger.info(f"{trade.pair} DCA skipped: {prob_col}={prob:.3f} < {self.dca_ml_guard.value}")
+                return None
+
+        stake = first_order.stake_amount_filled * self.safety_order_volume_scale.value ** (safety_done + 1)
+        if min_stake:
+            stake = max(stake, min_stake)
+        if stake > max_stake:
+            logger.info(f"{trade.pair} DCA skipped: stake {stake:.2f} > available {max_stake:.2f}")
+            return None
+
+        logger.info(
+            f"{trade.pair} Safety order {safety_done + 1}/{self.max_safety_orders.value}: "
+            f"loss from first entry {loss_from_first:.2%} <= {trigger:.2%}, stake {stake:.2f}"
+        )
+        return stake, f"safety_order_{safety_done + 1}"
+
+    def custom_exit(
+        self,
+        pair: str,
+        trade: Trade,
+        current_time: datetime,
+        current_rate: float,
+        current_profit: float,
+        **kwargs,
+    ) -> Optional[str]:
+        """Regime-protection exits.
+
+        The flash-move / volume-spike / sentiment / BTC / emergency parameters and
+        indicator columns existed, and confirm_trade_exit even whitelisted their
+        emoji tags, but nothing ever produced those exits. This wires them up:
+        each one only fires against the trade's direction and only while the trade
+        is in profit, so it locks gains instead of duplicating the stoploss.
+        """
+        if not self.regime_change_enabled.value:
+            return None
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=pair, timeframe=self.timeframe)
+        if dataframe is None or dataframe.empty:
+            return None
+        last = dataframe.iloc[-1]
+
+        def flag(col: str) -> bool:
+            val = last.get(col, False)
+            return bool(val) if pd.notna(val) else False
+
+        lock = self.emergency_exit_profit_threshold.value
+        if trade.is_short:
+            flash, vol, sentiment, btc = "flash_pump", "volume_pump", "sentiment_shift_bull", "btc_flash_pump"
+            side = "Pump"
+        else:
+            flash, vol, sentiment, btc = "flash_dump", "volume_dump", "sentiment_shift_bear", "btc_flash_dump"
+            side = "Dump"
+
+        if self.flash_move_enabled.value and flag(flash) and current_profit > lock:
+            return f"⚡ Flash {side} Protection"
+        if self.volume_spike_enabled.value and flag(vol) and current_profit > 0:
+            return f"🔊 Volume {side} Protection"
+        if self.sentiment_protection_enabled.value and flag(sentiment) and current_profit > lock:
+            return "🌊 Sentiment Shift Protection"
+        if flag(btc) and current_profit > 0:
+            return f"₿ BTC {side} Protection"
+        if self.emergency_exit_enabled.value and flag("regime_alert") and current_profit > lock:
+            return "🎯 Regime Alert Protection"
+        return None
+
     def confirm_trade_exit(
         self,
         pair: str,
@@ -4883,47 +4457,21 @@ class AlexNexusForgeV8AIV2(IStrategy):
         current_time: datetime,
         **kwargs,
     ) -> bool:
-        current_profit_ratio = trade.calc_profit_ratio(rate)
-        trade_duration = (
-            current_time - trade.open_date_utc
-        ).total_seconds() / 3600  # Hours
+        """Never block stop-type exits.
 
-        always_allow = [
-            "stoploss",
-            "stop_loss",
-            "custom_stoploss",
-            "roi",
-            "trend_reversal",
-            "emergency_exit",
-        ]
-
-        # Allow regime protection exits
-        if any(char in exit_reason for char in ["⚡", "🔊", "🌊", "🎯", "₿"]):
-            return True
-
-        # Allow known good exits
-        if exit_reason in always_allow:
-            return True
-
-        # Allow trailing stop only if in profit
-        if exit_reason in ["trailing_stop_loss", "trailing_stop"]:
-            if current_profit_ratio > 0:  # Only allow trailing if trade is profitable
+        The old version rejected "trailing_stop_loss" whenever the trade was not in
+        profit. With use_custom_stoploss, a stop that has been moved at least once is
+        reported as trailing_stop_loss, so losing trades could not be stopped out
+        and kept bleeding (freqtrade retries and keeps refusing). Blocking is now
+        opt-in via allow_trailing_exit_when_negative=False and bounded by
+        trailing_exit_min_profit.
+        """
+        if exit_reason == "trailing_stop_loss" and not self.allow_trailing_exit_when_negative.value:
+            profit = trade.calc_profit_ratio(rate)
+            if profit < self.trailing_exit_min_profit.value:
                 logger.info(
-                    f"{pair} Allowing trailing stop exit. Profit: {current_profit_ratio:.2%}"
-                )
-                return True
-            else:
-                logger.info(
-                    f"{pair} Blocking trailing stop exit. Trade not in profit: {current_profit_ratio:.2%}"
+                    f"{pair} Blocking trailing stop exit at {profit:.2%} "
+                    f"(< {self.trailing_exit_min_profit.value:.2%})"
                 )
                 return False
-
-        # Allow timeout exit after 4 hours
-        if trade_duration > 4:
-            logger.info(
-                f"{pair} Forcing exit due to max holding time (4h). Profit: {current_profit_ratio:.2%}"
-            )
-            return True
-
-        # Allow all other exits
         return True
